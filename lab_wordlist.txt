@@ -1,0 +1,29 @@
+# Custom wordlist — PortSwigger LLM / OpenAI lab (0af400e1...)
+# Target: https://0af400e1048e8a0f80883a85001c00c0.web-security-academy.net/
+# Found live: /openai/logs, /chat
+/api
+/api/logs
+/openai/logs
+/openai/chat
+/chat
+/chat/logs
+/logs
+/v1/chat
+/v1/logs
+/v1/chat/completions
+/v1/completions
+/openapi.json
+/swagger.json
+/api-docs
+/v3/api-docs
+/api/openapi.json
+/api/swagger.json
+/my-account
+/product
+/graphql
+/rest/user/login
+/api/users
+/api/products
+/api/login
+/api/auth
+/api/orders

@@ -1,0 +1,215 @@
+[
+  {
+    "method": "GET",
+    "path": "/api/users.json",
+    "normalized_path": "/api/users.json",
+    "full_url": "http://localhost:8000/api/users.json",
+    "sources": [
+      "crawler"
+    ],
+    "discovery_methods": [
+      "html_link"
+    ],
+    "parameters": [],
+    "headers_observed": [
+      "Server",
+      "Date",
+      "Content-type",
+      "Content-Length",
+      "Last-Modified"
+    ],
+    "status_codes_observed": {
+      "200": 1
+    },
+    "documented": false,
+    "doc_operation_id": null,
+    "security_score": null,
+    "tags": [],
+    "evidence": [
+      {
+        "origin": "http://localhost:8000/api/users.json",
+        "detail": "200 application/json",
+        "timestamp": "2026-09-24T13:38:45.394877+00:00"
+      }
+    ],
+    "first_seen": "2026-09-24T13:38:45.394906+00:00",
+    "last_seen": "2026-09-24T13:38:45.394911+00:00",
+    "endpoint_id": "058d89c86ae5"
+  },
+  {
+    "method": "GET",
+    "path": "/api/health.json",
+    "normalized_path": "/api/health.json",
+    "full_url": "http://localhost:8000/api/health.json",
+    "sources": [
+      "crawler"
+    ],
+    "discovery_methods": [
+      "html_link"
+    ],
+    "parameters": [],
+    "headers_observed": [
+      "Server",
+      "Date",
+      "Content-type",
+      "Content-Length",
+      "Last-Modified"
+    ],
+    "status_codes_observed": {
+      "200": 1
+    },
+    "documented": false,
+    "doc_operation_id": null,
+    "security_score": null,
+    "tags": [],
+    "evidence": [
+      {
+        "origin": "http://localhost:8000/api/health.json",
+        "detail": "200 application/json",
+        "timestamp": "2026-09-24T13:38:45.597607+00:00"
+      }
+    ],
+    "first_seen": "2026-09-24T13:38:45.597631+00:00",
+    "last_seen": "2026-09-24T13:38:45.597636+00:00",
+    "endpoint_id": "9928b8c86f7c"
+  },
+  {
+    "method": "GET",
+    "path": "/api/products.json",
+    "normalized_path": "/api/products.json",
+    "full_url": "http://localhost:8000/api/products.json",
+    "sources": [
+      "crawler"
+    ],
+    "discovery_methods": [
+      "html_link"
+    ],
+    "parameters": [],
+    "headers_observed": [
+      "Server",
+      "Date",
+      "Content-type",
+      "Content-Length",
+      "Last-Modified"
+    ],
+    "status_codes_observed": {
+      "200": 1
+    },
+    "documented": false,
+    "doc_operation_id": null,
+    "security_score": null,
+    "tags": [],
+    "evidence": [
+      {
+        "origin": "http://localhost:8000/api/products.json",
+        "detail": "200 application/json",
+        "timestamp": "2026-09-24T13:38:46.613959+00:00"
+      }
+    ],
+    "first_seen": "2026-09-24T13:38:46.613987+00:00",
+    "last_seen": "2026-09-24T13:38:46.613992+00:00",
+    "endpoint_id": "a7e28defe49f"
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/orders",
+    "normalized_path": "/api/v1/orders",
+    "full_url": null,
+    "sources": [
+      "js_static"
+    ],
+    "discovery_methods": [
+      "js_fetch_call"
+    ],
+    "parameters": [],
+    "headers_observed": [],
+    "status_codes_observed": {},
+    "documented": false,
+    "doc_operation_id": null,
+    "security_score": null,
+    "tags": [],
+    "evidence": [
+      {
+        "origin": "http://localhost:8000/app.js",
+        "detail": "matched fetch\\s*\\(\\s*[`'\"]([^`'\"]+)[`'\"]... -> /api/v1/orders",
+        "timestamp": "2026-09-24T13:38:47.024971+00:00"
+      },
+      {
+        "origin": "http://localhost:8000/app.js",
+        "detail": "matched fetch\\s*\\(\\s*[`'\"]([^`'\"]+)[`'\"]... -> /api/v1/orders",
+        "timestamp": "2026-09-24T13:38:48.250046+00:00"
+      }
+    ],
+    "first_seen": "2026-09-24T13:38:47.024987+00:00",
+    "last_seen": "2026-09-24T13:38:48.250064+00:00",
+    "endpoint_id": "768826b35b73"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/search",
+    "normalized_path": "/v1/search",
+    "full_url": null,
+    "sources": [
+      "js_static"
+    ],
+    "discovery_methods": [
+      "js_fetch_call"
+    ],
+    "parameters": [],
+    "headers_observed": [],
+    "status_codes_observed": {},
+    "documented": false,
+    "doc_operation_id": null,
+    "security_score": null,
+    "tags": [],
+    "evidence": [
+      {
+        "origin": "http://localhost:8000/app.js",
+        "detail": "matched axios(?:\\.\\w+)?\\s*\\(\\s*[`'\"]([^`'\"]+)[`'... -> /v1/search?q=test",
+        "timestamp": "2026-09-24T13:38:47.025037+00:00"
+      },
+      {
+        "origin": "http://localhost:8000/app.js",
+        "detail": "matched axios(?:\\.\\w+)?\\s*\\(\\s*[`'\"]([^`'\"]+)[`'... -> /v1/search?q=test",
+        "timestamp": "2026-09-24T13:38:48.250106+00:00"
+      }
+    ],
+    "first_seen": "2026-09-24T13:38:47.025044+00:00",
+    "last_seen": "2026-09-24T13:38:48.250113+00:00",
+    "endpoint_id": "c796a11a9cb0"
+  },
+  {
+    "method": "POST",
+    "path": "/graphql",
+    "normalized_path": "/graphql",
+    "full_url": null,
+    "sources": [
+      "js_static"
+    ],
+    "discovery_methods": [
+      "js_fetch_call"
+    ],
+    "parameters": [],
+    "headers_observed": [],
+    "status_codes_observed": {},
+    "documented": false,
+    "doc_operation_id": null,
+    "security_score": null,
+    "tags": [],
+    "evidence": [
+      {
+        "origin": "http://localhost:8000/app.js",
+        "detail": "matched url\\s*:\\s*[`'\"]([^`'\"]+)[`'\"]... -> /graphql",
+        "timestamp": "2026-09-24T13:38:47.025078+00:00"
+      },
+      {
+        "origin": "http://localhost:8000/app.js",
+        "detail": "matched url\\s*:\\s*[`'\"]([^`'\"]+)[`'\"]... -> /graphql",
+        "timestamp": "2026-09-24T13:38:48.250132+00:00"
+      }
+    ],
+    "first_seen": "2026-09-24T13:38:47.025090+00:00",
+    "last_seen": "2026-09-24T13:38:48.250138+00:00",
+    "endpoint_id": "ee944cf7a48b"
+  }
+]

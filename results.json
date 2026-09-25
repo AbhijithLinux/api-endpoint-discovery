@@ -1,0 +1,49 @@
+[
+  {
+    "url": "https://0ab0003504094c3289da6adb0083009c.web-security-academy.net/api",
+    "source": "common_path",
+    "sources": [
+      "common_path"
+    ],
+    "found_in": null,
+    "method": "GET",
+    "status": 200,
+    "status_category": "2xx",
+    "content_type": "text/html",
+    "parameters": [],
+    "response_structure": {
+      "type": "html"
+    },
+    "final_url": "https://0ab0003504094c3289da6adb0083009c.web-security-academy.net/api/",
+    "redirected": true,
+    "redirect_chain": [
+      "https://0ab0003504094c3289da6adb0083009c.web-security-academy.net/api",
+      "https://0ab0003504094c3289da6adb0083009c.web-security-academy.net/api/"
+    ],
+    "response_time_ms": 1612.7,
+    "response_size": 3270,
+    "response_size_truncated": false,
+    "headers": {
+      "content-length": "1090",
+      "server": null,
+      "allow": null,
+      "www-authenticate": null,
+      "location": null,
+      "access-control-allow-origin": null
+    },
+    "api_behavior": {
+      "classification": "unlikely",
+      "evidence": [
+        "14: HTML page response"
+      ]
+    },
+    "access": {
+      "classification": "public",
+      "evidence": [
+        "4: 2xx response without supplied credentials"
+      ]
+    },
+    "warnings": [],
+    "error": null
+  }
+]
