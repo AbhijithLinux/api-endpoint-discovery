@@ -24,11 +24,8 @@ python3 -m venv venv
 source venv/bin/activate          # Windows: .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-# 2. Serve the demo site (terminal 1)
-make server                        # serves test_site/ on :8000
-
-# 3. Run the full pipeline (terminal 2)
-python crawler.py http://localhost:8000/ --analyze
+# 2. Run the full pipeline (terminal 2)
+python crawler.py http://<TARGET-ADDRESS>/ --analyze
 ```
 
 Expected: 11 pages crawled → 6 API candidates → a JSON report with classifications like `confirmed`, `likely`, `public`.
@@ -40,9 +37,6 @@ Expected: 11 pages crawled → 6 API candidates → a JSON report with classific
 ```bash
 # Crawl only — see what the spider finds
 python crawler.py http://localhost:8000/
-
-# Full pipeline — print the analysis as JSON
-python crawler.py http://localhost:8000/ --analyze
 
 # Save the report to a file
 python crawler.py http://localhost:8000/ --analyze -o results.json
@@ -105,7 +99,6 @@ make test      # unit tests — pure mocks, no network needed
 ## 🚧 Known limitations
 
 - The crawler follows `<a href>` links only — JS-rendered SPAs yield few pages (discovery's script scan compensates).
-- Discovery is heuristic, not exhaustive — no recursive fuzzing, no giant wordlists.
 - Analysis sends GET requests only — POST/PUT/DELETE endpoints are judged by their GET behavior.
 - Dynamically built URLs (e.g. `` `/api/products/${id}/price` `` template literals) aren't extracted yet.
 
