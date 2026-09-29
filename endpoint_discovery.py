@@ -7,8 +7,8 @@ Sources (docs-first order — brute-force wordlist runs LAST as fallback):
                     (REST/OpenAPI, GraphQL, gRPC, WebSocket, webhooks, SOAP)
                     and extract real endpoints from them. Includes the
                     classic spec-location probe (openapi/swagger) as fallback.
-  4. common_path  — small controlled wordlist of common API paths (GET only),
-                    used only after docs (fallback).
+  4. common_path  — user-supplied wordlist only (GET only),
+                    used only after docs (fallback). No built-in default.
 
 Backward compatible:
     discover_endpoints(crawl_records)  # original behaviour, crawler source only
@@ -45,25 +45,35 @@ OPENAPI_LOCATIONS = (
     "/api-docs/openapi.json",
 )
 
-# Small controlled MVP wordlist — no brute forcing.
-COMMON_API_PATHS = (
+# No built-in default wordlist: common_path source runs only when the
+# caller supplies `wordlist=` and/or `extra_paths=` (see discover_endpoints).
+# Kept as an empty tuple for backward-compatible imports.
+COMMON_API_PATHS: tuple[str, ...] = ()
+
+# Default doc landing pages probed standalone (cheap GETs, no brute-force).
+# These often RENDER the docs without a doc-ish crawled URL
+# (e.g. GET /api returns the HTML route list). Wordlist brute-forcing
+# stays opt-in via --wordlist FILE.
+DEFAULT_DOC_PATHS = (
     "/api",
-    "/api/users",
-    "/api/products",
-    "/api/login",
-    "/api/auth",
-    "/api/orders",
-    "/api/users/",
-    "/api/products/",
-    "/api/v1/users",
-    "/api/v1/products",
-    "/v1/users",
-    "/v1/products",
+    "/api/",
+    "/docs",
+    "/docs/",
+    "/api/docs",
+    "/api-docs",
+    "/redoc",
+    "/swagger",
+    "/swagger/",
+    "/openapi",
+    "/openapi/",
     "/graphql",
-    "/rest/user/login",
-    "/chat",
-    "/openai/logs",
+    "/graphiql",
+    "/playground",
 )
+
+# Sitemap <loc> entries.
+_SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<>\s]+)\s*</loc>", re.I)
+_MAX_ROBOTS_SITEMAP_BYTES = 500_000
 
 _TIMEOUT = 5
 _MAX_JS_FILES = 10
@@ -420,6 +430,67 @@ def _parse_doc_body(text, page_url, origin):
     return hits
 
 
+def _robots_sitemap_source(store, target_url, session):
+    """Fetch /robots.txt + /sitemap.xml (default, cheap GETs).
+
+    robots Disallow/Allow paths and sitemap <loc> URLs on the same host
+    are added as candidates (sources "robots"/"sitemap"). Returns extra
+    same-host page URLs to also parse as doc pages.
+    """
+    origin = _origin(target_url)
+    host = urlparse(target_url).netloc
+    extra_pages: list[str] = []
+
+    def _same_host(u: str) -> bool:
+        try:
+            return urlparse(u).netloc == host
+        except (ValueError, UnicodeError):
+            return False
+
+    sitemap_urls: list[str] = [origin + "/sitemap.xml"]
+    try:
+        r = session.get(origin + "/robots.txt", timeout=_TIMEOUT)
+        body = r.text[:_MAX_ROBOTS_SITEMAP_BYTES] if r.status_code == 200 else ""
+    except requests.RequestException:
+        body = ""
+    if body and body.strip():
+        for line in body.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            low = s.lower()
+            if low.startswith(("disallow:", "allow:")):
+                path = s.split(":", 1)[1].strip().split()[0] if ":" in s else ""
+                if path.startswith("/") and not path.startswith("/*"):
+                    u = origin + path.split("#")[0]
+                    if _same_host(u):
+                        _add(store, u, "robots")
+                        extra_pages.append(u)
+            elif low.startswith("sitemap:"):
+                sm = s.split(":", 1)[1].strip().split()[0] if ":" in s else ""
+                if sm and (sm.startswith("/") or _same_host(sm)):
+                    u = sm if urlparse(sm).netloc else origin + sm
+                    if _same_host(u) and u not in sitemap_urls:
+                        sitemap_urls.append(u)
+
+    for sm_url in sitemap_urls[:5]:
+        try:
+            r = session.get(sm_url, timeout=_TIMEOUT)
+            xml = r.text[:_MAX_ROBOTS_SITEMAP_BYTES] if r.status_code == 200 else ""
+        except requests.RequestException:
+            continue
+        if not xml or "<loc>" not in xml.lower():
+            continue
+        for loc in _SITEMAP_LOC_RE.findall(xml)[:200]:
+            u = loc.strip().split("#")[0]
+            if not u or not _same_host(u):
+                continue
+            _add(store, u, "sitemap")
+            extra_pages.append(u)
+
+    return list(dict.fromkeys(extra_pages))
+
+
 def _docs_source(store, crawl_records, target_url, session):
     """Fetch doc pages found in the crawl (docs-first) + spec-location probe.
 
@@ -446,8 +517,17 @@ def _docs_source(store, crawl_records, target_url, session):
         except (ValueError, UnicodeError):
             continue
 
-    # Always probe the classic spec locations too (cheap, docs-driven).
+    # Always probe the classic spec locations + default doc landing
+    # pages too (cheap, docs-driven, standalone without wordlist).
     probe_urls = [origin + loc for loc in OPENAPI_LOCATIONS]
+    for loc in DEFAULT_DOC_PATHS:
+        u = origin + loc
+        if u not in probe_urls:
+            probe_urls.append(u)
+    # robots.txt / sitemap.xml: default discovery surface.
+    for u in _robots_sitemap_source(store, target_url, session):
+        if u not in pages and u not in probe_urls:
+            probe_urls.append(u)
     for u in pages:
         if u not in probe_urls:
             probe_urls.append(u)
@@ -485,6 +565,9 @@ def _common_path_source(store, target_url, session, extra_paths=None, verbose=Fa
     GREEN, RESET = "\033[92m", "\033[0m"
     origin = _origin(target_url)
     paths = list(COMMON_API_PATHS) + list(extra_paths or [])
+    if not paths:
+        print("  [wordlist] skipped: no wordlist supplied (--wordlist FILE)", flush=True)
+        return
     total = len(paths)
     hits = 0
     print(f"  [wordlist] brute-forcing {total} paths...", flush=True)
@@ -673,13 +756,15 @@ def discover_endpoints(
                     # webhooks, SOAP — before any brute-forcing.
                     _docs_source(store, crawl_records, target_url, session)
                 if enable_common_paths:
-                    # Fallback LAST: only brute-force the wordlist now.
+                    # Wordlist runs only when explicitly supplied (--wordlist
+                    # FILE or extra_paths=); there is no built-in default.
                     wl = []
                     if wordlist:
                         wl += load_wordlist(wordlist)
                     if extra_paths:
                         wl += list(extra_paths)
-                    _common_path_source(store, target_url, session, extra_paths=wl, verbose=verbose)
+                    if wl:
+                        _common_path_source(store, target_url, session, extra_paths=wl, verbose=verbose)
                 if enable_docs or enable_openapi:
                     # Second docs pass: the wordlist often uncovers HTML
                     # doc pages (e.g. /api landing page) that weren't in
