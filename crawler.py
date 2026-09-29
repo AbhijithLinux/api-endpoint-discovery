@@ -39,14 +39,27 @@ def extract_links(html, current_url):
     soup = BeautifulSoup(html, "html.parser")
 
     links = []
+    base = current_url.split("#")[0]
 
     for link in soup.find_all("a"):
 
         href = link.get("href")
 
-        if href:
-            full_url = urljoin(current_url, href)
-            links.append(full_url)
+        if not href:
+            continue
+        href = href.strip()
+        if not href or href.startswith("#"):
+            continue  # same-page anchor — never a new page
+        try:
+            # Fragments never identify a distinct page: strip them so
+            # "page.html#menu" and "page.html" queue as one URL and
+            # no extra HTTP request is ever issued for an anchor.
+            full_url = urljoin(current_url, href).split("#")[0].strip()
+        except (ValueError, UnicodeError):
+            continue
+        if not full_url or full_url == base and href.startswith("#"):
+            continue
+        links.append(full_url)
 
     return links
 
@@ -120,6 +133,16 @@ def crawl(start_url, max_pages=50, delay=0.0):
 
         url = queue.pop(0)
 
+        # Normalize BEFORE any network I/O: a fragment is never a
+        # distinct page. Fold "page#x" -> "page" without a request.
+        clean = url.split("#")[0].strip() or url
+        if clean != url:
+            visited.add(url)
+            url = clean
+            if url in visited:
+                continue
+            seen.add(url)
+
         if url in visited:
             continue
 
@@ -155,14 +178,28 @@ def crawl(start_url, max_pages=50, delay=0.0):
 
             links = extract_links(html, canon)
 
+            # Docs-first: queue API-doc pages ahead of generic pages so
+            # docs are fetched before any brute-forcing happens downstream.
+            doc_first, doc_later = [], []
             for link in links:
                 if (
                     is_allowed(link, domain)
                     and link not in visited
                     and link not in seen
                 ):
-                    seen.add(link)
-                    queue.append(link)
+                    low = link.lower()
+                    if any(h in low for h in (
+                        "swagger", "openapi", "redoc", "api-docs",
+                        "graphql", "graphiql", "playground", "grpc",
+                        "websocket", "/ws", "webhook", "wsdl", "soap",
+                        "api/docs", "developer",
+                    )):
+                        doc_first.append(link)
+                    else:
+                        doc_later.append(link)
+            for link in doc_first + doc_later:
+                seen.add(link)
+                queue.append(link)
 
             # Template-literal extraction: collect only, append after the
             # loop so max_pages (real pages) semantics stay unchanged.

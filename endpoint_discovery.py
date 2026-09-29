@@ -1,10 +1,14 @@
 """endpoint_discovery.py — Abhijith's multi-source API endpoint discovery.
 
-Sources:
+Sources (docs-first order — brute-force wordlist runs LAST as fallback):
   1. crawler      — passive filter over crawl() records (original MVP logic).
   2. javascript   — static inspection of <script> resources for API string refs.
-  3. openapi/swagger — passive probe of common spec locations, extract `paths` keys.
-  4. common_path  — small controlled wordlist of common API paths (GET only).
+  3. docs         — fetch API documentation pages found during the crawl
+                    (REST/OpenAPI, GraphQL, gRPC, WebSocket, webhooks, SOAP)
+                    and extract real endpoints from them. Includes the
+                    classic spec-location probe (openapi/swagger) as fallback.
+  4. common_path  — small controlled wordlist of common API paths (GET only),
+                    used only after docs (fallback).
 
 Backward compatible:
     discover_endpoints(crawl_records)  # original behaviour, crawler source only
@@ -24,10 +28,10 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-PATH_HINTS = ("/api/", "/v1/", "/v2/", "/graphql", "/chat", "/openai/", "/logs")
+PATH_HINTS = ("/api/", "/v1/", "/v2/", "/graphql", "/chat", "/openai/", "/logs", "/resources/")
 
 # Extra hint used ONLY for JS-extracted strings (Juice Shop uses /rest/*).
-JS_PATH_HINTS = ("/api/", "/api", "/v1/", "/v2/", "/rest/", "/graphql")
+JS_PATH_HINTS = ("/api/", "/api", "/v1/", "/v2/", "/rest/", "/graphql", "/resources/")
 
 OPENAPI_LOCATIONS = (
     "/swagger.json",
@@ -59,6 +63,9 @@ COMMON_API_PATHS = (
     "/rest/user/login",
     "/chat",
     "/openai/logs",
+    "/api/v2/resources",
+    "/api/v2/resources/books",
+    "/api/v2/resources/books/all",
 )
 
 _TIMEOUT = 5
@@ -71,9 +78,53 @@ _LIVE_STATUSES = set(list(range(200, 400)) + [401, 403, 405])
 
 # Matches quoted strings that look like API paths: "/api/users", '/v1/x', ...
 _JS_API_RE = re.compile(
-    r"""["'`](/(?:api|v1|v2|rest|graphql)(?:[A-Za-z0-9_\-./{}:$]*))["'`]"""
+    r"""["'`](/(?:api|v1|v2|rest|graphql|resources)(?:[A-Za-z0-9_\-./{}:$]*))["'`]"""
 )
 _SRC_RE = re.compile(r"""<script[^>]+src=["'`]([^"'`#]+)["'`]""", re.I)
+
+# Substrings identifying API documentation pages (any protocol). Used to
+# pick doc pages out of crawl records AND to prioritize them in the crawler.
+DOC_PAGE_HINTS = (
+    "swagger", "openapi", "redoc", "api-docs", "api/docs", "api-doc",
+    "developer", "api-reference", "api_reference", "reference/api",
+    "graphql", "graphiql", "playground", "altair",
+    "grpc", "proto", "bufbuild",
+    "websocket", "web-socket", "/ws", "wsdl", "soap",
+    "webhook", "web-hook", "asyncapi", "postman", "insomnia",
+    "schema", ".proto", ".wsdl",
+)
+
+# <a href="..."> links inside doc pages pointing at machine-readable specs.
+_DOC_SPEC_HREF_RE = re.compile(
+    r"""<a[^>]+href=["'`]([^"'`#]+\.(?:json|ya?ml|wsdl|proto|graphqls?)(?:\?[^"'`#]*)?)["'`]""",
+    re.I,
+)
+# ws(s):// URLs (WebSocket endpoints) mentioned in docs.
+_WS_URL_RE = re.compile(r"""["'`](wss?://[^"'`\s<>]+)["'`]""", re.I)
+# SOAP: <soap:address location="..."/> and operation names.
+_SOAP_ADDR_RE = re.compile(
+    r"""<soap(?::\w+)?:address[^>]+location=["'`]([^"'`]+)["'`]""", re.I
+)
+_SOAP_OP_RE = re.compile(
+    r"""<wsdl:operation[^>]+name=["'`]([^"'`]+)["'`]""", re.I
+)
+# Webhook paths: "/webhooks/...", "/hook/...", quoted.
+_WEBHOOK_PATH_RE = re.compile(
+    r"""["'`](/(?:webhooks?|hooks?|callbacks?)(?:[A-Za-z0-9_\-./{}:$]*))["'`]"""
+)
+# Generic REST-ish quoted paths inside docs (broader than the JS regex).
+_DOC_API_PATH_RE = re.compile(
+    r"""["'`](/(?:api|v1|v2|v3|rest|graphql|grpc|ws|soap|resources)(?:[A-Za-z0-9_\-./{}:$]*))["'`]"""
+)
+# Bare (unquoted) API paths as they appear in human-readable docs, e.g.
+# <code>/api/v2/resources/books/all</code> or "GET /api/v2/resources/books?id=1".
+# Query strings are kept so parameterized routes survive.
+_DOC_BARE_PATH_RE = re.compile(
+    r"""(?<![A-Za-z0-9_:/])(/(?:api(?:/v\d+)?/resources/[A-Za-z0-9_\-./{}:$]*)(?:\?[^\s\"'<>()]*)?)""",
+)
+
+_MAX_DOC_PAGES = 15
+_MAX_DOC_BYTES = 1_000_000
 
 
 def is_api_candidate(record):
@@ -195,6 +246,197 @@ def _openapi_source(store, target_url, session):
             _add(store, origin + p, label)
 
 
+def is_doc_page(url):
+    """True if a crawled URL looks like API documentation (any protocol)."""
+    try:
+        low = (urlparse(url).path or "").lower() + url.lower()
+    except (ValueError, UnicodeError):
+        return False
+    return any(h in low for h in DOC_PAGE_HINTS)
+
+
+def _doc_pages_from_crawl(crawl_records):
+    """Pick doc-page URLs out of crawl records, deduped, order-preserved."""
+    out, seen = [], set()
+    for record in crawl_records or []:
+        if not isinstance(record, dict):
+            continue
+        url = record.get("url")
+        if not isinstance(url, str) or not url:
+            continue
+        clean = url.split("#")[0].strip()
+        if not clean or clean in seen:
+            continue
+        if is_doc_page(clean):
+            seen.add(clean)
+            out.append(clean)
+        if len(out) >= _MAX_DOC_PAGES:
+            break
+    return out
+
+
+def _extract_openapi_paths(text, origin):
+    """Parse an OpenAPI/Swagger JSON doc body -> list of absolute endpoint URLs."""
+    try:
+        doc = json.loads(text[:_MAX_DOC_BYTES])
+    except (ValueError, json.JSONDecodeError):
+        return []
+    paths = doc.get("paths") if isinstance(doc, dict) else None
+    if not isinstance(paths, dict):
+        return []
+    out = []
+    for p in paths:
+        if isinstance(p, str) and p.startswith("/"):
+            out.append(origin + p)
+    return out
+
+
+def _parse_doc_body(text, page_url, origin):
+    """Extract (url, source-label) hits from one fetched doc page body.
+
+    Covers REST (spec links + quoted paths), GraphQL, WebSocket (ws URLs),
+    webhooks, SOAP (address + WSDL ops), gRPC (proto links / grpc paths).
+    """
+    hits = []
+    low = text.lower()
+
+    # 1. REST/OpenAPI request-body style: whole page IS a JSON spec.
+    stripped = text.strip()
+    if stripped[:1] == "{":
+        for u in _extract_openapi_paths(stripped, origin):
+            hits.append((u, "openapi"))
+
+    # 2. Spec-file links inside the HTML (<a href="...openapi.yaml"> etc).
+    for href in _DOC_SPEC_HREF_RE.findall(text):
+        spec_url = urljoin(page_url, href)
+        if not urlparse(spec_url).netloc:
+            continue
+        slow = spec_url.lower()
+        if slow.endswith((".wsdl",)):
+            hits.append((spec_url, "soap"))
+        elif slow.endswith((".proto",)):
+            hits.append((spec_url, "grpc"))
+        else:
+            hits.append((spec_url, "openapi"))
+
+    # 3. Generic quoted REST-ish paths in the docs.
+    for p in _DOC_API_PATH_RE.findall(text):
+        p = p.strip()
+        if not p or " " in p or "\\n" in p:
+            continue
+        hits.append((urljoin(origin, p), "rest-docs"))
+
+    # 3b. Bare API resource paths in human-readable docs (<code> blocks,
+    # "GET /api/v2/..." lines). Keeps query strings (?id=1&author=...).
+    for p in _DOC_BARE_PATH_RE.findall(text):
+        p = p.strip().rstrip(".,);:")
+        if not p or " " in p or "\\n" in p:
+            continue
+        hits.append((urljoin(origin, p), "rest-docs"))
+
+    # 4. GraphQL: endpoint refs + playground hints.
+    if "graphql" in low:
+        for p in re.findall(
+            r"""["'`](/(?:graphql\w*(?:[A-Za-z0-9_\-./{}:$]*))?)["'`]""",
+            text,
+            re.I,
+        ):
+            if p and p.strip():
+                hits.append((urljoin(origin, p.strip()), "graphql"))
+        if "/graphql" not in [h[0].replace(origin, "") for h in hits]:
+            hits.append((origin + "/graphql", "graphql"))
+
+    # 5. WebSocket: literal ws(s):// URLs + /ws path refs.
+    for w in _WS_URL_RE.findall(text):
+        hits.append((w.strip(), "websocket"))
+    if "websocket" in low or "socket.io" in low:
+        for p in re.findall(
+            r"""["'`](/(?:ws|socket\.?io|realtime)(?:[A-Za-z0-9_\-./{}:$]*))["'`]""",
+            text,
+            re.I,
+        ):
+            if p and p.strip():
+                hits.append((urljoin(origin, p.strip()), "websocket"))
+
+    # 6. Webhooks.
+    for p in _WEBHOOK_PATH_RE.findall(text):
+        if p and p.strip():
+            hits.append((urljoin(origin, p.strip()), "webhook"))
+
+    # 7. SOAP: <soap:address location> + operation names.
+    for addr in _SOAP_ADDR_RE.findall(text):
+        addr = addr.strip()
+        if addr:
+            hits.append((
+                addr if urlparse(addr).netloc else urljoin(page_url, addr),
+                "soap",
+            ))
+    if "wsdl" in low or "soap" in low:
+        for op in _SOAP_OP_RE.findall(text):
+            op = op.strip()
+            if op and " " not in op:
+                hits.append((urljoin(origin, "/soap/" + op), "soap"))
+        for href in re.findall(
+            r"""["'`]([^"'`#]*\?wsdl[^"'`]*)["'`]""", text, re.I
+        ):
+            if href.strip():
+                hits.append((urljoin(page_url, href.strip()), "soap"))
+
+    # 8. gRPC: .proto refs, grpc paths.
+    if "grpc" in low or ".proto" in low:
+        for p in re.findall(
+            r"""["'`](/(?:grpc[A-Za-z0-9_\-./{}:$]*))["'`]""", text, re.I
+        ):
+            if p and p.strip():
+                hits.append((urljoin(origin, p.strip()), "grpc"))
+
+    return hits
+
+
+def _docs_source(store, crawl_records, target_url, session):
+    """Fetch doc pages found in the crawl (docs-first) + spec-location probe.
+
+    Returns the number of distinct URLs added. GET only; errors skipped.
+    """
+    origin = _origin(target_url)
+    before = len(store)
+    pages = _doc_pages_from_crawl(crawl_records)
+
+    # Always probe the classic spec locations too (cheap, docs-driven).
+    probe_urls = [origin + loc for loc in OPENAPI_LOCATIONS]
+    for u in pages:
+        if u not in probe_urls:
+            probe_urls.append(u)
+
+    for doc_url in probe_urls[: _MAX_DOC_PAGES + len(OPENAPI_LOCATIONS)]:
+        try:
+            r = session.get(
+                doc_url, timeout=_TIMEOUT,
+                headers={"Accept": "application/json, text/html, */*;q=0.8"},
+            )
+        except requests.RequestException:
+            continue
+        if r.status_code != 200:
+            continue
+        try:
+            body = r.text[:_MAX_DOC_BYTES]
+        except (ValueError, UnicodeError):
+            continue
+        if not body or not body.strip():
+            continue
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        is_spec = "swagger" in doc_url or "openapi" in doc_url or "api-docs" in doc_url
+        if ("json" in ctype or is_spec) and body.strip()[:1] == "{":
+            for u in _extract_openapi_paths(body, origin):
+                label = "swagger" if "swagger" in doc_url else "openapi"
+                _add(store, u, label)
+            continue
+        for url, label in _parse_doc_body(body, doc_url, origin):
+            _add(store, url, label)
+
+    return len(store) - before
+
+
 def _common_path_source(store, target_url, session, extra_paths=None, verbose=False):
     GREEN, RESET = "\033[92m", "\033[0m"
     origin = _origin(target_url)
@@ -249,14 +491,17 @@ def discover_endpoints(
     target_url=None,
     enable_javascript=True,
     enable_openapi=True,
+    enable_docs=True,
     enable_common_paths=True,
     wordlist=None,
     extra_paths=None,
     verbose=False,
 ):
-    """Multi-source discovery. Always includes the passive crawler source.
+    """Multi-source discovery, docs-first. Always includes passive crawler source.
 
-    `target_url` enables network sources (javascript/openapi/common_path).
+    `target_url` enables network sources (javascript/docs/common_path).
+    Docs (REST/OpenAPI, GraphQL, gRPC, WebSocket, webhooks, SOAP) are
+    fetched BEFORE the wordlist; the wordlist is a last-resort fallback.
     With no target_url the behaviour is identical to the original MVP.
     Only GET requests are sent; 404/5xx/network errors are skipped silently.
     """
@@ -272,9 +517,12 @@ def discover_endpoints(
             try:
                 if enable_javascript:
                     _javascript_source(store, target_url, session)
-                if enable_openapi:
-                    _openapi_source(store, target_url, session)
+                if enable_docs or enable_openapi:
+                    # Docs-first: REST/OpenAPI, GraphQL, gRPC, WebSocket,
+                    # webhooks, SOAP — before any brute-forcing.
+                    _docs_source(store, crawl_records, target_url, session)
                 if enable_common_paths:
+                    # Fallback LAST: only brute-force the wordlist now.
                     wl = []
                     if wordlist:
                         wl += load_wordlist(wordlist)
