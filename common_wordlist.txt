@@ -199,14 +199,5 @@
 /internal/api
 /private
 /private/
-/api/v2/resources
-/api/v2/resources/books
-/api/v2/resources/books/random
-/api/v2/resources/books/random4
-/api/v2/resources/books/all
-/api/v2/resources/books?id=1
-/api/v2/resources/books?author=J.K.%20Rowling
-/api/v2/resources/books?published=1993
-/api/v2/resources/books?author=J.K.%20Rowling&published=2003
 /api/resources
 /api/resources/books

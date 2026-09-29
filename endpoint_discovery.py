@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 
@@ -63,9 +63,6 @@ COMMON_API_PATHS = (
     "/rest/user/login",
     "/chat",
     "/openai/logs",
-    "/api/v2/resources",
-    "/api/v2/resources/books",
-    "/api/v2/resources/books/all",
 )
 
 _TIMEOUT = 5
@@ -108,6 +105,13 @@ _SOAP_ADDR_RE = re.compile(
 _SOAP_OP_RE = re.compile(
     r"""<wsdl:operation[^>]+name=["'`]([^"'`]+)["'`]""", re.I
 )
+# Continuation of a query value after a raw space in human-readable docs,
+# e.g. "?author=J.K. Rowling&published=2003" (stops at <, quotes, parens).
+_CONTINUATION_RE = re.compile(r"((?: +[A-Za-z0-9_.&,=%+$-]+)+)")
+# Query ending in a dotted abbreviation ("...author=J.K") — the next 1-2
+# alpha words almost certainly continue the value (" Rowling").
+_ABBREV_TAIL_RE = re.compile(r"\.[A-Za-z]+$")
+
 # Webhook paths: "/webhooks/...", "/hook/...", quoted.
 _WEBHOOK_PATH_RE = re.compile(
     r"""["'`](/(?:webhooks?|hooks?|callbacks?)(?:[A-Za-z0-9_\-./{}:$]*))["'`]"""
@@ -328,18 +332,33 @@ def _parse_doc_body(text, page_url, origin):
 
     # 3b. Bare API resource paths in human-readable docs (<code> blocks,
     # "GET /api/v2/..." lines). Keeps query strings (?id=1&author=...).
-    # Drops values truncated at a raw space (e.g. "?author=J.K. Rowling"
-    # matches "?author=J.K" + " Rowling..."): the match is a prefix of a
-    # longer value, so emitting it would create a junk truncated candidate.
-    # The encoded wordlist entries cover the real route instead.
+    # Raw spaces in printed query values ("?author=J.K. Rowling") are
+    # reconstructed and percent-encoded; a match followed by plain prose
+    # ("?published=1993 (This query...)") is kept as-is.
     for m in _DOC_BARE_PATH_RE.finditer(text):
-        p = m.group(1).strip().rstrip(".,);:")
+        raw = m.group(1).strip()
+        p = raw.rstrip(".,);:")
         if not p or " " in p or "\\n" in p:
             continue
-        if "?" in p:
-            rest = text[m.end(1): m.end(1) + 2]
-            if rest[:1] == " " and rest[1:2] and rest[1:2] not in "<\"'`)":
-                continue  # truncated multi-word query value — skip
+        if "?" in raw:
+            cont = _CONTINUATION_RE.match(text, m.end(1))
+            if cont:
+                extra = cont.group(1)
+                # Use the raw (dot-preserving) match here: a trailing "."
+                # may belong to an abbreviation ("J.K."), not prose.
+                base, _, q = raw.rstrip(",);:").partition("?")
+                if "=" in extra or "&" in extra:
+                    # More params follow the space (" Rowling&published=2003").
+                    p = base + "?" + quote((q + extra).strip(), safe="=&%")
+                elif _ABBREV_TAIL_RE.search(q.rstrip(".")):
+                    # Abbrev value continues ("J.K." + " Rowling").
+                    words = extra.split()
+                    if 1 <= len(words) <= 2 and all(
+                        re.fullmatch(r"[A-Za-z.]+", w) for w in words
+                    ):
+                        p = base + "?" + quote(
+                            (q + " " + " ".join(words)).strip(), safe="=&%"
+                        )
         hits.append((urljoin(origin, p), "rest-docs"))
 
     # 4. GraphQL: endpoint refs + playground hints.
@@ -508,6 +527,113 @@ def load_wordlist(path):
                 s = "/" + s
             if s not in out:
                 out.append(s)
+    return out
+
+
+# Params probed on bare (query-less) API endpoints: ?id=1, ?page=1, ...
+COMMON_PROBE_PARAMS = ("id", "page", "limit", "offset", "user_id", "author", "published")
+
+# Year-like params are never numerically enumerated (1..N is junk there).
+_YEAR_LIKE_PARAMS = ("year", "published", "birth", "birthyear", "yob")
+
+# Benign boundary/type values appended for each numeric param
+# (0, -1, huge, non-numeric) — error messages on these leak info.
+BOUNDARY_VALUES = ("0", "-1", "99999", "abc")
+
+
+def expand_param_variants(candidates, max_numeric=5, max_total=50,
+                          probe_bare=True):
+    """Fuzz query params across candidates. Three moves, all GET-safe:
+
+    1. Numeric enum: any numeric param (?id=1, ?page=2, ?limit=10)
+       -> 1..max_numeric (year-like params skipped).
+    2. Boundary/type probes per numeric param: 0, -1, 99999, abc.
+    3. Bare probing: query-less API-ish endpoints get COMMON_PROBE_PARAMS
+       with value 1 (?id=1, ?page=1, ...) to test for hidden filtering.
+
+    Non-numeric values (author names) are never mutated. Returns NEW
+    candidate dicts (source "param-fuzz"); inputs untouched. Capped at
+    max_total new URLs — pair with --delay on real targets.
+    """
+    from urllib.parse import parse_qsl, urlsplit, urlunsplit, urlencode
+
+    seen = set()
+    for c in candidates or []:
+        u = c.get("url") if isinstance(c, dict) else None
+        if isinstance(u, str):
+            seen.add(u.split("#")[0])
+    out = []
+
+    def _emit(url):
+        if url in seen or len(out) >= max_total:
+            return False
+        seen.add(url)
+        out.append({
+            "url": url, "source": "param-fuzz",
+            "sources": ["param-fuzz"],
+        })
+        return len(out) >= max_total
+
+    def _is_api_path(path):
+        low = (path or "").lower()
+        return any(h in low for h in (
+            "/api/", "/v1/", "/v2/", "/v3/", "/rest/", "/graphql",
+            "/resources/",
+        ))
+
+    for c in candidates or []:
+        if not isinstance(c, dict) or not isinstance(c.get("url"), str):
+            continue
+        try:
+            parts = urlsplit(c["url"].split("#")[0])
+        except (ValueError, UnicodeError):
+            continue
+        if not parts.query:
+            # Move 3: bare API endpoint -> probe common params (?id=1 ...).
+            if probe_bare and _is_api_path(parts.path):
+                for name in COMMON_PROBE_PARAMS:
+                    new_url = urlunsplit((
+                        parts.scheme, parts.netloc, parts.path,
+                        urlencode([(name, "1")]), "",
+                    ))
+                    if _emit(new_url):
+                        return out
+            continue
+        try:
+            pairs = parse_qsl(parts.query, keep_blank_values=True)
+        except (ValueError, UnicodeError):
+            continue
+        for name, value in pairs:
+            if not value.isdigit():
+                continue
+            if name.lower() in _YEAR_LIKE_PARAMS:
+                continue  # enumerating years 1..N is junk
+            # Move 1: numeric range 1..max_numeric.
+            for n in range(1, max_numeric + 1):
+                if str(n) == value:
+                    continue
+                new_pairs = [
+                    (k, str(n) if k == name else v) for k, v in pairs
+                ]
+                if _emit(urlunsplit((
+                    parts.scheme, parts.netloc, parts.path,
+                    urlencode(new_pairs), "",
+                ))):
+                    return out
+            # Move 2: boundary/type probes (skip ones already covered).
+            for b in BOUNDARY_VALUES:
+                if b == value:
+                    continue
+                if b.isdigit() and 1 <= int(b) <= max_numeric:
+                    continue  # already emitted by the range above
+                new_pairs = [
+                    (k, b if k == name else v) for k, v in pairs
+                ]
+                if _emit(urlunsplit((
+                    parts.scheme, parts.netloc, parts.path,
+                    urlencode(new_pairs), "",
+                ))):
+                    return out
     return out
 
 

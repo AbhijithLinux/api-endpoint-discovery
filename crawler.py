@@ -250,6 +250,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-pages", type=int, default=50, help="Max pages to crawl (default: 50)")
     parser.add_argument("--delay", type=float, default=0.0, help="Seconds to wait between requests to avoid bombarding the site (default: 0)")
     parser.add_argument("--wordlist", default=None, help="Extra wordlist file (one path per line, #comments ignored)")
+    parser.add_argument("--enum-ids", type=int, default=0, help="Fuzz query params: enumerate numeric values (id=1..N), boundary probes (0,-1,99999,abc), and probe common params (?id/?page/...) on bare API endpoints; 0 disables (default: 0)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show each wordlist path as it is checked")
     args = parser.parse_args()
 
@@ -268,9 +269,17 @@ if __name__ == "__main__":
     print("Pages visited:", len(records))
 
     try:
-        from endpoint_discovery import discover_endpoints
+        from endpoint_discovery import discover_endpoints, expand_param_variants
 
         candidates = discover_endpoints(records, target_url=start_url, wordlist=args.wordlist, verbose=args.verbose)
+        if args.enum_ids and args.enum_ids > 0:
+            extra = expand_param_variants(candidates, max_numeric=args.enum_ids)
+            have = {c["url"] for c in candidates}
+            for e in extra:
+                if e["url"] not in have:
+                    have.add(e["url"])
+                    candidates.append(e)
+            print(f"Param enumeration: +{len(extra)} variants (id=1..{args.enum_ids})")
         print(f"API candidates: {len(candidates)}")
         for candidate in candidates:
             print(f"  - {candidate['url']}")

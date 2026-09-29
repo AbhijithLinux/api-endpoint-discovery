@@ -60,6 +60,13 @@ SENSITIVE_PATTERNS = (
     "session", "cookie", "jwt", "code", "signature", "credential",
 )
 
+# Single-word compounds the camelCase/separator tokenizer cannot split.
+_SENSITIVE_COMPOUNDS = frozenset({
+    "authorization", "authenticated", "authentication", "authenticator",
+    "sessionid", "authtoken", "apikey", "secretkey", "clientsecret",
+    "accesstoken", "refreshtoken", "idtoken",
+})
+
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 LOGIN_PATH_RE = re.compile(
@@ -488,8 +495,28 @@ class EndpointAnalyzer:
             decoded = unquote(key)
         except Exception:
             decoded = key
-        norm = decoded.lower().replace("-", "").replace("_", "")
-        return any(p in norm for p in SENSITIVE_PATTERNS)
+        # Token-based match (split on separators + camelCase humps) so
+        # that "author" does NOT match the "auth" pattern while
+        # "api_key"/"authToken"/"password" still do. Substring matching
+        # here blanked innocent params and produced false 404s.
+        # _SENSITIVE_COMPOUNDS covers single-word compounds the
+        # tokenizer cannot split ("authorization", "sessionid").
+        try:
+            tokens = re.findall(
+                r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+", decoded
+            )
+        except (TypeError, re.error):
+            tokens = []
+        if not tokens:
+            norm = decoded.lower().replace("-", "").replace("_", "")
+            return any(p in norm for p in SENSITIVE_PATTERNS)
+        for tok in tokens:
+            low = tok.lower()
+            if low in SENSITIVE_PATTERNS or low in _SENSITIVE_COMPOUNDS:
+                return True
+            if low.endswith("s") and low[:-1] in SENSITIVE_PATTERNS:
+                return True  # plurals: tokens, keys, secrets, cookies
+        return False
 
     def _sanitize_query(
         self,
