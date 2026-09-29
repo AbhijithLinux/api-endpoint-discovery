@@ -44,6 +44,12 @@ python crawler.py http://localhost:8000/ --analyze -o results.json
 # Keep big sites manageable (default: 50 pages)
 python crawler.py https://example.com/ --analyze --max-pages 20
 
+# Be polite — wait N seconds between requests so you don't hammer the site
+python crawler.py https://example.com/ --analyze --delay 1
+
+# Use the bundled 200-entry wordlist instead of the built-in 16
+python crawler.py http://10.49.149.174/ --analyze --wordlist common_wordlist.txt -v
+
 # Try it against OWASP Juice Shop
 python crawler.py http://localhost:3000/ --analyze -o results.json
 ```
@@ -54,6 +60,9 @@ python crawler.py http://localhost:3000/ --analyze -o results.json
 | `--analyze` | Probe each candidate and print the full JSON report |
 | `-o FILE` | Write the report to `FILE` instead of stdout |
 | `--max-pages N` | Stop crawling after `N` pages (default: 50) |
+| `--delay SECONDS` | Wait N seconds between requests to avoid bombarding the site (default: 0) |
+| `--wordlist FILE` | Extra wordlist file (one path per line, `#` comments ignored); e.g. `--wordlist common_wordlist.txt` |
+| `-v` | Show each wordlist path as it is checked |
 
 ---
 
@@ -66,7 +75,7 @@ One call — `discover_endpoints(crawl_records, target_url)` — fuses four sour
 | `crawler` | Passive filter over crawled pages — `/api/`, `/v1/`, `/v2/`, `/graphql`, `.json` URLs, JSON content types |
 | `javascript` | Statically scans same-origin `<script>` files for API strings (`fetch`, `axios`, …). Nothing is executed |
 | `openapi` / `swagger` | Probes known spec locations (`/openapi.json`, `/api-docs`, …) and extracts `paths` keys |
-| `common_path` | A tight 14-entry wordlist (`/api/users`, `/graphql`, …) checked with GET only |
+| `common_path` | A tight 16-entry built-in wordlist (`/api/users`, `/graphql`, …) checked with GET only — extend with `--wordlist common_wordlist.txt` (200 entries) |
 
 Every candidate looks like this — so you always know *why* something was flagged:
 
@@ -91,8 +100,16 @@ Each endpoint gets one safe GET (sensitive query values are blanked before sendi
 ## ✅ Testing
 
 ```bash
-make test      # unit tests — pure mocks, no network needed
+python -m pytest test_endpoint_discovery.py -q      # unit tests — pure mocks, no network needed
 ```
+
+---
+
+## 🕷️ Crawler notes
+
+- Template-literal URLs (e.g. `` `/api/products/${id}/price` `` in inline scripts) are extracted, `${...}` is normalized to `1`, and added as crawl records so discovery flags them.
+- HTTP redirects are canonicalized: the **final** URL is recorded, so links that bounce to `/` don't create duplicate homepage entries.
+- Fragment-only links (`page.html#menu` vs `page.html#`) currently still enter the queue separately — strip `#` fragments before queuing if this litters your output.
 
 ---
 
@@ -100,7 +117,7 @@ make test      # unit tests — pure mocks, no network needed
 
 - The crawler follows `<a href>` links only — JS-rendered SPAs yield few pages (discovery's script scan compensates).
 - Analysis sends GET requests only — POST/PUT/DELETE endpoints are judged by their GET behavior.
-- Dynamically built URLs (e.g. `` `/api/products/${id}/price` `` template literals) aren't extracted yet.
+- External `<script src>` bundles aren't parsed by the crawler for template literals yet — only inline scripts are.
 
 ---
 
