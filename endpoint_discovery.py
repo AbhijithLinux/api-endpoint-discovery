@@ -328,10 +328,18 @@ def _parse_doc_body(text, page_url, origin):
 
     # 3b. Bare API resource paths in human-readable docs (<code> blocks,
     # "GET /api/v2/..." lines). Keeps query strings (?id=1&author=...).
-    for p in _DOC_BARE_PATH_RE.findall(text):
-        p = p.strip().rstrip(".,);:")
+    # Drops values truncated at a raw space (e.g. "?author=J.K. Rowling"
+    # matches "?author=J.K" + " Rowling..."): the match is a prefix of a
+    # longer value, so emitting it would create a junk truncated candidate.
+    # The encoded wordlist entries cover the real route instead.
+    for m in _DOC_BARE_PATH_RE.finditer(text):
+        p = m.group(1).strip().rstrip(".,);:")
         if not p or " " in p or "\\n" in p:
             continue
+        if "?" in p:
+            rest = text[m.end(1): m.end(1) + 2]
+            if rest[:1] == " " and rest[1:2] and rest[1:2] not in "<\"'`)":
+                continue  # truncated multi-word query value — skip
         hits.append((urljoin(origin, p), "rest-docs"))
 
     # 4. GraphQL: endpoint refs + playground hints.
