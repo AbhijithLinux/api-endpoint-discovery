@@ -402,6 +402,23 @@ def _docs_source(store, crawl_records, target_url, session):
     before = len(store)
     pages = _doc_pages_from_crawl(crawl_records)
 
+    # Landing pages that often RENDER the docs without a doc-ish URL
+    # (e.g. GET /api returns the HTML route list). Only exact paths,
+    # so real API endpoints are never re-fetched as docs.
+    for record in crawl_records or []:
+        if not isinstance(record, dict):
+            continue
+        u = record.get("url")
+        if not isinstance(u, str) or not u:
+            continue
+        try:
+            if urlparse(u.split("#")[0]).path.rstrip("/") in ("", "/api", "/docs"):
+                clean = u.split("#")[0].strip()
+                if clean and clean not in pages:
+                    pages.append(clean)
+        except (ValueError, UnicodeError):
+            continue
+
     # Always probe the classic spec locations too (cheap, docs-driven).
     probe_urls = [origin + loc for loc in OPENAPI_LOCATIONS]
     for u in pages:
@@ -529,6 +546,15 @@ def discover_endpoints(
                     if extra_paths:
                         wl += list(extra_paths)
                     _common_path_source(store, target_url, session, extra_paths=wl, verbose=verbose)
+                if enable_docs or enable_openapi:
+                    # Second docs pass: the wordlist often uncovers HTML
+                    # doc pages (e.g. /api landing page) that weren't in
+                    # the crawl. Parse those too so query-string routes
+                    # (?author=, ?published=) listed on them are extracted.
+                    enriched = list(crawl_records or []) + [
+                        {"url": u} for u in store
+                    ]
+                    _docs_source(store, enriched, target_url, session)
             finally:
                 session.close()
     return _finalize(store)
