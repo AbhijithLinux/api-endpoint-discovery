@@ -6,6 +6,7 @@ import logging
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.parse import (
     parse_qsl,
@@ -1338,8 +1339,30 @@ class EndpointAnalyzer:
         if (
             _is_xml_content(content_type)
             or stripped.lower().startswith("<?xml")
+            or stripped[:1] == "<"
+            and self._looks_like_xml(stripped)
         ):
-            return {"type": "xml"}
+            if net["truncated"] or net["deadline"]:
+                return {"type": "unknown"}
+            struct = None
+            if not self._looks_like_html(stripped):
+                struct = self._parse_xml_structure(stripped)
+            if struct is not None:
+                if (
+                    not _is_xml_content(content_type)
+                    and not stripped.lower().startswith("<?xml")
+                ):
+                    result["warnings"].append(
+                        "XML despite content type "
+                        f"{content_type or 'unknown'}"
+                    )
+                return struct
+            if _is_xml_content(content_type):
+                result["warnings"].append(
+                    "malformed XML"
+                )
+                return {"type": "unknown"}
+            # Angle-bracket body that is actually HTML falls through.
 
         # 5. HTML
         if (
@@ -1357,6 +1380,145 @@ class EndpointAnalyzer:
 
         # 7. unknown
         return {"type": "unknown"}
+
+    @staticmethod
+    def _looks_like_xml(stripped: str) -> bool:
+        head = stripped[:200].lower()
+        return head.startswith("<") and re.match(
+            r"<\??[a-z_][\w\-.]*[:\s/>?]", head
+        ) is not None
+
+    @staticmethod
+    def _strip_ns(tag: str) -> tuple[str, str | None]:
+        """Split '{namespace}local' -> (local, namespace)."""
+        if tag.startswith("{"):
+            ns, _, local = tag[1:].partition("}")
+            return local, ns or None
+        return tag, None
+
+    def _parse_xml_structure(
+        self, stripped: str
+    ) -> dict[str, Any] | None:
+        """Parse XML body -> detailed structure (None if not XML).
+
+        Uses stdlib ElementTree only (no external entities resolved).
+        Depth capped at MAX_SCHEMA_DEPTH, children capped at
+        MAX_KEYS_PER_OBJECT, mirroring JSON inference.
+        """
+        try:
+            root = ET.fromstring(stripped)
+        except ET.ParseError:
+            return None
+        except (ValueError, MemoryError, RecursionError):
+            return None
+        except Exception:
+            return None
+        local, _ns = self._strip_ns(root.tag)
+        struct: dict[str, Any] = self._infer_xml_element(
+            root, 1
+        )
+        # RSS/Atom feed flag: content syndication, not an API.
+        low = local.lower()
+        if low == "rss" or (
+            low == "feed"
+            and "entry" in (struct.get("children") or {})
+        ):
+            struct["feed"] = "rss" if low == "rss" else "atom"
+        elif low == "feed" and "item" in (
+            struct.get("children") or {}
+        ):
+            struct["feed"] = "rss"
+        # SOAP envelope flag.
+        if low == "envelope":
+            body_child = None
+            fault = False
+            for child in struct.get("children") or {}:
+                if child.lower() == "body":
+                    nested = (struct.get("nested") or {}).get(
+                        child
+                    ) or {}
+                    ops = list(
+                        (nested.get("children") or {}).keys()
+                    )
+                    if ops:
+                        body_child = ops[0]
+                        op_nested = (nested.get("nested") or {}).get(
+                            ops[0]
+                        ) or {}
+                        fault = "fault" in (
+                            op_nested.get("children") or {}
+                        ) or ops[0].lower() == "fault"
+                    break
+            struct["soap"] = True
+            if body_child:
+                struct["operation"] = body_child
+            if fault:
+                struct["fault"] = True
+        return struct
+
+    def _infer_xml_element(
+        self, elem: Any, depth: int
+    ) -> dict[str, Any]:
+        """Recursive XML element inference down to MAX_SCHEMA_DEPTH."""
+        local, ns = self._strip_ns(elem.tag)
+        struct: dict[str, Any] = {
+            "type": "xml",
+            "root": local,
+        }
+        if ns:
+            struct["namespace"] = ns[:MAX_PARAM_EXAMPLE]
+        if elem.attrib:
+            attrs = sorted(str(k).split("}")[-1] for k in elem.attrib)
+            struct["attributes"] = attrs[:MAX_KEYS_PER_OBJECT]
+            if len(attrs) > MAX_KEYS_PER_OBJECT:
+                struct["note"] = (
+                    f"only first {MAX_KEYS_PER_OBJECT} "
+                    "attributes recorded"
+                )
+        counts: dict[str, int] = {}
+        order: list[str] = []
+        for child in list(elem)[: MAX_KEYS_PER_OBJECT * 2]:
+            try:
+                name, _ = self._strip_ns(child.tag)
+            except (ValueError, AttributeError):
+                continue
+            counts[name] = counts.get(name, 0) + 1
+            if name not in order:
+                order.append(name)
+        if order:
+            struct["children"] = {
+                n: counts[n] for n in order[:MAX_KEYS_PER_OBJECT]
+            }
+            repeated = sorted(
+                n for n, c in counts.items() if c > 1
+            )
+            if repeated:
+                struct["repeated"] = repeated[:MAX_KEYS_PER_OBJECT]
+            if depth < MAX_SCHEMA_DEPTH:
+                nested: dict[str, Any] = {}
+                seen: set[str] = set()
+                for child in list(elem):
+                    try:
+                        name, _ = self._strip_ns(child.tag)
+                    except (ValueError, AttributeError):
+                        continue
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    if len(nested) >= MAX_KEYS_PER_OBJECT:
+                        break
+                    nested[name] = self._infer_xml_element(
+                        child, depth + 1
+                    )
+                    if len(seen) >= MAX_KEYS_PER_OBJECT:
+                        break
+                if nested:
+                    struct["nested"] = nested
+        else:
+            text = (elem.text or "").strip()
+            if text:
+                struct["text"] = text[:MAX_PARAM_EXAMPLE]
+        return struct
 
     def _primitive_type(self, value: Any) -> str:
         if value is None:
@@ -1556,6 +1718,15 @@ class EndpointAnalyzer:
                 ],
             )
 
+        if _is_xml_content(ct) and stype == "unknown":
+            return self._behavior(
+                "likely",
+                [
+                    "6b: XML content type but body "
+                    "could not be parsed"
+                ],
+            )
+
         if json_ct and stype == "empty":
             return self._behavior(
                 "uncertain",
@@ -1586,9 +1757,43 @@ class EndpointAnalyzer:
             )
 
         if stype == "xml":
+            feed = struct.get("feed") if isinstance(
+                struct, dict
+            ) else None
+            if feed:
+                return self._behavior(
+                    "uncertain",
+                    [
+                        f"10: {feed.upper()} feed response, "
+                        "not an API"
+                    ],
+                )
+            root = struct.get("root") if isinstance(
+                struct, dict
+            ) else None
+            detail = f" (root <{root}>)" if root else ""
+            if isinstance(struct, dict) and struct.get("fault"):
+                op = struct.get("operation")
+                return self._behavior(
+                    "likely",
+                    [
+                        "10: SOAP fault response"
+                        + (f" (operation {op})" if op else "")
+                    ],
+                )
+            if isinstance(struct, dict) and struct.get("soap"):
+                op = struct.get("operation")
+                return self._behavior(
+                    "likely",
+                    [
+                        "10: SOAP envelope response"
+                        + (f" (operation {op})" if op else "")
+                        + detail
+                    ],
+                )
             return self._behavior(
                 "likely",
-                ["10: XML response"],
+                [f"10: XML response{detail}"],
             )
 
         if (
