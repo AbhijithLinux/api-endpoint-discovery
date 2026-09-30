@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import codecs
 import html
+import ipaddress
 import json
 import logging
+import math
 import re
 import sys
 import time
-import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.parse import (
     parse_qsl,
-    quote,
     unquote,
     urljoin,
     urlsplit,
@@ -30,16 +31,11 @@ from requests.exceptions import (
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 MAX_SCHEMA_DEPTH = 4
 MAX_KEYS_PER_OBJECT = 50
 MAX_ARRAY_ITEMS_TO_INSPECT = 5
 CHUNK_SIZE = 8192
 
-# Maximum raw response bytes consumed by the analyzer.
 DEFAULT_MAX_RESPONSE_SIZE = 1_000_000
 
 MAX_PARAM_EXAMPLE = 40
@@ -47,26 +43,30 @@ MAX_HEADER_VALUE = 200
 MAX_FOUND_IN = 5
 FOUND_IN_TRUNCATE = 300
 
-# Maximum decoded text retained for response-structure inspection.
-# This is separate from the raw-byte download limit.
 BODY_READ_LIMIT = 1_000_000
 
 REDACTED = "REDACTED"
 SOURCE_DEFAULT = "endpoint_discovery"
 
-# Note: Trailing spaces were removed from these patterns to fix a bug
-# where common sensitive keys (like "token" or "api_key") were not matched.
 SENSITIVE_PATTERNS = (
-    "token", "key", "secret", "password", "passwd", "pwd", "auth",
-    "session", "cookie", "jwt", "code", "signature", "credential",
+    "token", "access_token", "refresh_token", "id_token", "bearer",
+    "api_key", "apikey", "key", "secret", "password", "passwd", "pwd",
+    "auth", "authorization", "session", "sessionid", "cookie", "jwt",
+    "csrf", "xsrf", "code", "signature", "credential", "private_key",
+    "client_secret", "webhook_secret", "database_password", "db_password",
+    "sid", "sig",
 )
 
-# Single-word compounds the camelCase/separator tokenizer cannot split.
-_SENSITIVE_COMPOUNDS = frozenset({
-    "authorization", "authenticated", "authentication", "authenticator",
-    "sessionid", "authtoken", "apikey", "secretkey", "clientsecret",
-    "accesstoken", "refreshtoken", "idtoken",
-})
+SENSITIVE_VALUE_PATTERNS = (
+    re.compile(r"(?i)\b(?:sk|pk)_(?:live|test)_[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"(?i)\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"(?i)\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"(?i)\b(?:eyJ[A-Za-z0-9_-]{5,}\.){2}[A-Za-z0-9_-]{5,}\b"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
+)
+MAX_SENSITIVE_FINDINGS = 20
+MAX_SENSITIVE_VALUE = 500
+
 
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
@@ -78,8 +78,8 @@ UUID_SEG_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
+HEX24_SEG_RE = re.compile(r"[0-9a-fA-F]{24}")
 
-# Binary/static response media types.
 _BINARY_TYPES = {
     "application/pdf",
     "application/zip",
@@ -89,7 +89,6 @@ _BINARY_TYPES = {
     "application/x-gzip",
 }
 
-# JavaScript/CSS are text/static resources, not binary.
 _JS_CSS_TYPES = {
     "application/javascript",
     "application/x-javascript",
@@ -121,7 +120,7 @@ def _is_xml_content(ct: str | None) -> bool:
 
 
 class EndpointAnalyzer:
-    """Analyze endpoint candidates from discovery output with safe GET requests."""
+    """Passive endpoint analysis with bounded HTTP observation and explainable findings."""
 
     def __init__(
         self,
@@ -132,27 +131,39 @@ class EndpointAnalyzer:
         max_redirects: int = 5,
         max_response_size: int = DEFAULT_MAX_RESPONSE_SIZE,
         request_delay: float = 0.1,
+        redact_sensitive: bool = False,
+        send_sensitive_params: bool = False,
+        options_probe: bool = True,
+        allowed_hosts: list[str] | tuple[str, ...] | set[str] | None = None,
+        allowed_redirect_hosts: list[str] | tuple[str, ...] | set[str] | None = None,
+        inspect_sensitive_response_data: bool = True,
+        max_sensitive_findings: int = MAX_SENSITIVE_FINDINGS,
     ) -> None:
-        # Strict type validation to prevent raw TypeErrors from leaking
         if type(timeout) not in (int, float):
             raise ValueError("timeout must be a number > 0")
         if timeout <= 0:
             raise ValueError("timeout must be > 0")
-            
+
         if type(max_redirects) is not int:
             raise ValueError("max_redirects must be an integer >= 0")
         if max_redirects < 0:
             raise ValueError("max_redirects must be >= 0")
-            
+
         if type(max_response_size) not in (int, float):
             raise ValueError("max_response_size must be a number > 0")
         if max_response_size <= 0:
             raise ValueError("max_response_size must be > 0")
-            
+
         if type(request_delay) not in (int, float):
             raise ValueError("request_delay must be a number >= 0")
         if request_delay < 0:
             raise ValueError("request_delay must be >= 0")
+        if type(max_sensitive_findings) is not int or max_sensitive_findings < 0:
+            raise ValueError("max_sensitive_findings must be an integer >= 0")
+
+        for numeric_name, numeric_value in (("timeout", timeout), ("max_response_size", max_response_size), ("request_delay", request_delay)):
+            if isinstance(numeric_value, float) and not math.isfinite(numeric_value):
+                raise ValueError(f"{numeric_name} must be finite")
 
         self.timeout = float(timeout)
         self.verify_ssl = bool(verify_ssl)
@@ -160,6 +171,13 @@ class EndpointAnalyzer:
         self.max_redirects = int(max_redirects)
         self.max_response_size = int(max_response_size)
         self.request_delay = float(request_delay)
+        self.redact_sensitive = bool(redact_sensitive)
+        self.send_sensitive_params = bool(send_sensitive_params)
+        self.options_probe = bool(options_probe)
+        self.allowed_hosts = self._normalize_host_set(allowed_hosts)
+        self.allowed_redirect_hosts = self._normalize_host_set(allowed_redirect_hosts)
+        self.inspect_sensitive_response_data = bool(inspect_sensitive_response_data)
+        self.max_sensitive_findings = max_sensitive_findings
 
         self.base_url: str | None = None
         if base_url is not None:
@@ -169,7 +187,6 @@ class EndpointAnalyzer:
             self.base_url = str(base_url).strip()
 
         self._session = requests.Session()
-        # Never use environment proxies or implicit credentials.
         self._session.trust_env = False
         self._session.headers.update({
             "User-Agent": "API-Endpoint-Analyzer/1.0",
@@ -178,8 +195,6 @@ class EndpointAnalyzer:
 
         self._last_request_end: float | None = None
         self._wrapper_target: str | None = None
-
-    # -- lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
         """Close the underlying HTTP session."""
@@ -193,8 +208,6 @@ class EndpointAnalyzer:
 
     def __exit__(self, *_exc: Any) -> None:
         self.close()
-
-    # -- public analysis API ------------------------------------------------
 
     def analyze_endpoint(self, candidate: Any) -> dict[str, Any]:
         """Analyze one candidate; never raises, always returns a result record."""
@@ -211,7 +224,6 @@ class EndpointAnalyzer:
 
     def analyze_candidates(self, candidates: Any) -> list[dict[str, Any]]:
         """Analyze many candidates; accepts list/dict wrapper/single item/None."""
-        # Do not leak a previous wrapper target into later calls.
         self._wrapper_target = None
         items: list[Any]
 
@@ -234,7 +246,6 @@ class EndpointAnalyzer:
         try:
             return [self.analyze_endpoint(item) for item in items]
         finally:
-            # Prevent stale target state after this batch.
             self._wrapper_target = None
 
     def analyze_discovery_file(
@@ -269,8 +280,6 @@ class EndpointAnalyzer:
                 json.dump(results, fh, indent=2, ensure_ascii=False)
 
         return results
-
-    # -- core per-candidate flow --------------------------------------------
 
     def _analyze_into(self, result: dict[str, Any], candidate: Any) -> None:
         url_raw: Any = None
@@ -348,15 +357,13 @@ class EndpointAnalyzer:
             }
             return
 
-        error = self._validate_resolved(resolved)
+        error = self._validate_resolved(resolved, self.allowed_hosts)
         if error is not None:
             result["error"] = error
             return
 
         visible_url = self._rebuild(resolved)
 
-        # Query parameters are extracted from the visible input URL before
-        # sensitive values are sanitized.
         result["parameters"] = self._extract_parameters(visible_url)
 
         request_url, _sent_query, changed = self._sanitize_query(visible_url)
@@ -372,8 +379,6 @@ class EndpointAnalyzer:
                 net["elapsed_s"] * 1000, 1
             )
             self._finalize(result, net, request_url)
-
-    # -- URL helpers ---------------------------------------------------------
 
     @staticmethod
     def _parse_http_url(
@@ -395,7 +400,6 @@ class EndpointAnalyzer:
         if not parts.hostname:
             return None
 
-        # Reject userinfo (e.g., https://user:pass@host.com)
         if parts.username is not None or parts.password is not None:
             return None
 
@@ -442,7 +446,8 @@ class EndpointAnalyzer:
 
     @staticmethod
     def _validate_resolved(
-        parts: tuple[str, str, str, str, str]
+        parts: tuple[str, str, str, str, str],
+        allowed_hosts: set[str] | None = None,
     ) -> dict[str, str] | None:
         candidate = urlunsplit(parts)
         try:
@@ -480,6 +485,12 @@ class EndpointAnalyzer:
                 "message": "URL contains userinfo which is rejected",
             }
 
+        if allowed_hosts is not None and host not in allowed_hosts:
+            return {
+                "type": "host_not_allowed",
+                "message": "URL hostname is not in allowed_hosts",
+            }
+
         return None
 
     @staticmethod
@@ -496,58 +507,39 @@ class EndpointAnalyzer:
             decoded = unquote(key)
         except Exception:
             decoded = key
-        # Token-based match (split on separators + camelCase humps) so
-        # that "author" does NOT match the "auth" pattern while
-        # "api_key"/"authToken"/"password" still do. Substring matching
-        # here blanked innocent params and produced false 404s.
-        # _SENSITIVE_COMPOUNDS covers single-word compounds the
-        # tokenizer cannot split ("authorization", "sessionid").
-        try:
-            tokens = re.findall(
-                r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+", decoded
-            )
-        except (TypeError, re.error):
-            tokens = []
-        if not tokens:
-            norm = decoded.lower().replace("-", "").replace("_", "")
-            return any(p in norm for p in SENSITIVE_PATTERNS)
-        for tok in tokens:
-            low = tok.lower()
-            if low in SENSITIVE_PATTERNS or low in _SENSITIVE_COMPOUNDS:
-                return True
-            if low.endswith("s") and low[:-1] in SENSITIVE_PATTERNS:
-                return True  # plurals: tokens, keys, secrets, cookies
-        return False
+        norm = decoded.lower().replace("-", "").replace("_", "")
+        return any(p in norm for p in SENSITIVE_PATTERNS)
 
     def _sanitize_query(
         self,
         url: str,
     ) -> tuple[str, str | None, bool]:
         """
-        Blank sensitive query values.
-        Returns:
-            (request_url, sanitized_query, changed)
+        Blank sensitive query values while preserving original query encoding.
         """
         parts = urlsplit(url)
         if not parts.query:
             return url, None, False
 
-        pairs = parse_qsl(
-            parts.query,
-            keep_blank_values=True,
-        )
         changed = False
         out: list[str] = []
 
-        for name, value in pairs:
-            encoded_name = quote(name, safe="")
-            if self._is_sensitive_key(name) and value:
-                out.append(f"{encoded_name}=")
+        for pair in parts.query.split("&"):
+            if not pair:
+                continue
+
+            name, sep, value = pair.partition("=")
+
+            if (
+                sep
+                and value
+                and self._is_sensitive_key(name)
+                and not self.send_sensitive_params
+            ):
+                out.append(f"{name}=")
                 changed = True
             else:
-                out.append(
-                    f"{encoded_name}={quote(value, safe='')}"
-                )
+                out.append(pair)
 
         new_query = "&".join(out)
         rebuilt = urlunsplit(
@@ -562,6 +554,9 @@ class EndpointAnalyzer:
         return rebuilt, new_query, changed
 
     def _redact_url_string(self, url: str) -> str:
+        if not self.redact_sensitive:
+            return url
+
         try:
             parts = urlsplit(url)
         except (ValueError, UnicodeError):
@@ -602,8 +597,6 @@ class EndpointAnalyzer:
         except (ValueError, UnicodeError):
             return "<unparseable-url>"
 
-    # -- networking ----------------------------------------------------------
-
     def _throttle(self) -> None:
         """Enforce request_delay between network requests."""
         if self._last_request_end is None or self.request_delay <= 0:
@@ -638,16 +631,14 @@ class EndpointAnalyzer:
         result: dict[str, Any],
         initial_url: str,
     ) -> dict[str, Any] | None:
-        """Manual-redirect GET loop."""
+        """Manual-redirect GET loop with optional OPTIONS fallback on 405."""
         current_url = initial_url
         chain: list[str] = [initial_url]
         redirect_host = self._redirect_host(initial_url)
         hops = 0
         connect_s = 0.0
         body_s = 0.0
-        
-        # Wrap the loop to ensure cookies are cleared EXACTLY ONCE per candidate,
-        # allowing them to persist across redirect hops but isolating them between candidates.
+
         try:
             while True:
                 self._throttle()
@@ -707,7 +698,7 @@ class EndpointAnalyzer:
                         chain,
                     )
                     return None
-                
+
                 connect_s += time.perf_counter() - t_conn0
                 try:
                     status = response.status_code
@@ -723,7 +714,7 @@ class EndpointAnalyzer:
                         status in REDIRECT_STATUSES
                         and bool(location and location.strip())
                     )
-                    
+
                     if is_redirect and self.follow_redirects:
                         if hops >= self.max_redirects:
                             t_body0 = time.perf_counter()
@@ -744,7 +735,7 @@ class EndpointAnalyzer:
                                 connect_s + body_s
                             )
                             return observed
-                            
+
                         nxt, blocked_reason = self._resolve_redirect(
                             current_url,
                             location,
@@ -773,12 +764,12 @@ class EndpointAnalyzer:
                                 connect_s + body_s
                             )
                             return observed
-                        
+
                         try:
                             response.close()
                         except Exception:
                             pass
-                            
+
                         nxt_request, _, hop_changed = (
                             self._sanitize_query(nxt)
                         )
@@ -789,9 +780,8 @@ class EndpointAnalyzer:
                         current_url = nxt_request
                         chain.append(nxt_request)
                         hops += 1
-                        continue  # Inner finally handles cleanup & timestamp
-                    
-                    # Final response for this candidate.
+                        continue
+
                     t_body0 = time.perf_counter()
                     observed = self._read_body(
                         response,
@@ -809,6 +799,7 @@ class EndpointAnalyzer:
                     observed["elapsed_s"] = (
                         connect_s + body_s
                     )
+
                     if (
                         status in REDIRECT_STATUSES
                         and not (location and location.strip())
@@ -816,13 +807,25 @@ class EndpointAnalyzer:
                         result["warnings"].append(
                             "redirect without Location"
                         )
+
+                    if status == 405 and self.options_probe:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+
+                        self._mark_request_done()
+                        observed["options"] = self._perform_options(
+                            current_url,
+                            result,
+                        )
+
                     return observed
                 finally:
                     try:
                         response.close()
                     except Exception:
                         pass
-                    # Handled here for both normal returns and 'continue' statements
                     self._mark_request_done()
         finally:
             try:
@@ -830,9 +833,132 @@ class EndpointAnalyzer:
             except Exception:
                 pass
 
-    @staticmethod
-    def _short(message: str) -> str:
+    def _perform_options(
+        self,
+        url: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Perform a lightweight OPTIONS probe after a 405 GET response."""
+        try:
+            self._throttle()
+            logger.debug(
+                "OPTIONS probe for %s",
+                self._safe_log_url(url),
+            )
+            t0 = time.perf_counter()
+            response = self._session.request(
+                "OPTIONS",
+                url,
+                allow_redirects=False,
+                stream=False,
+                timeout=self.timeout,
+                verify=self.verify_ssl,
+            )
+            elapsed = time.perf_counter() - t0
+            headers = {
+                k.lower(): v
+                for k, v in response.headers.items()
+            }
+            status = response.status_code
+
+            try:
+                response.close()
+            except Exception:
+                pass
+
+            self._mark_request_done()
+            return {
+                "status": status,
+                "headers": headers,
+                "error": None,
+                "elapsed_s": elapsed,
+            }
+        except Timeout as exc:
+            self._mark_request_done()
+            return {
+                "status": None,
+                "headers": {},
+                "error": {
+                    "type": "timeout",
+                    "message": self._short(str(exc)),
+                },
+                "elapsed_s": None,
+            }
+        except SSLError as exc:
+            self._mark_request_done()
+            return {
+                "status": None,
+                "headers": {},
+                "error": {
+                    "type": "ssl_error",
+                    "message": self._short(str(exc)),
+                },
+                "elapsed_s": None,
+            }
+        except (
+            InvalidURL,
+            InvalidSchema,
+            MissingSchema,
+        ) as exc:
+            self._mark_request_done()
+            return {
+                "status": None,
+                "headers": {},
+                "error": {
+                    "type": "invalid_url",
+                    "message": self._short(str(exc)),
+                },
+                "elapsed_s": None,
+            }
+        except RequestsConnectionError as exc:
+            self._mark_request_done()
+            return {
+                "status": None,
+                "headers": {},
+                "error": {
+                    "type": "connection_error",
+                    "message": self._short(str(exc)),
+                },
+                "elapsed_s": None,
+            }
+        except RequestException as exc:
+            self._mark_request_done()
+            return {
+                "status": None,
+                "headers": {},
+                "error": {
+                    "type": "request_error",
+                    "message": self._short(str(exc)),
+                },
+                "elapsed_s": None,
+            }
+        except Exception as exc:
+            self._mark_request_done()
+            return {
+                "status": None,
+                "headers": {},
+                "error": {
+                    "type": "unexpected_error",
+                    "message": self._short(
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                },
+                "elapsed_s": None,
+            }
+
+    def _short(self, message: str) -> str:
         message = message.replace("\n", " ").strip()
+        # Requests exceptions can embed a full URL. Keep useful diagnostics while
+        # preventing accidental query-string leakage when redaction is enabled.
+        if self.redact_sensitive:
+            try:
+                message = re.sub(
+                    r"(?i)([?&](?:[^=&]*?(?:token|key|secret|password|auth|session|cookie|jwt|code|signature|credential)[^=&]*)=)[^&\s]+",
+                    r"\1" + REDACTED,
+                    message,
+                )
+            except re.error:
+                pass
         return message[:200] or "request failed"
 
     def _redirect_host(
@@ -845,8 +971,7 @@ class EndpointAnalyzer:
             return None
 
         host = (parts.hostname or "").lower()
-        # Strict hostname literal matching (no www. stripping)
-        
+
         try:
             port = parts.port
         except ValueError:
@@ -896,8 +1021,7 @@ class EndpointAnalyzer:
             return None, "redirect target has an invalid port"
 
         thost = (parts.hostname or "").lower()
-        # Strict hostname literal matching (no www. stripping)
-        
+
         if not thost:
             return None, "redirect target has no hostname"
 
@@ -907,25 +1031,21 @@ class EndpointAnalyzer:
         if origin is not None:
             oscheme, ohost, oport = origin
 
-            if thost != ohost:
+            same_site = self._same_site_host(thost, ohost)
+            explicitly_allowed = self._host_allowed(thost, self.allowed_redirect_hosts)
+            if not same_site and not explicitly_allowed:
                 return None, "redirect target is on a different host"
 
-            if scheme != oscheme:
-                if not (
-                    oscheme == "http"
-                    and scheme == "https"
-                    and oport == 80
-                    and tport == 443
-                ):
-                    return None, "redirect target changes scheme"
+            upgrade = oscheme == "http" and scheme == "https"
 
-            if tport != oport and not (
-                oscheme == "http"
-                and scheme == "https"
-                and oport == 80
-                and tport == 443
-            ):
+            if scheme != oscheme and not upgrade:
+                return None, "redirect target changes scheme"
+
+            if tport != oport and not upgrade and not explicitly_allowed:
                 return None, "redirect target changes port"
+
+            if self.allowed_hosts is not None and not self._host_allowed(thost, self.allowed_hosts):
+                return None, "redirect target hostname is not in allowed_hosts"
 
         return urlunsplit(
             (
@@ -937,8 +1057,6 @@ class EndpointAnalyzer:
             )
         ), None
 
-    # -- body reading --------------------------------------------------------
-
     def _read_body(
         self,
         response: requests.Response,
@@ -948,10 +1066,6 @@ class EndpointAnalyzer:
     ) -> dict[str, Any]:
         """
         Read at most max_response_size RAW bytes.
-        The raw-byte limit is enforced before UTF-8 decoding. A separate
-        decoded-text limit prevents pathological expansion from consuming
-        excessive memory while still allowing normal JSON responses up to
-        the configured raw response limit to be analyzed.
         """
         raw_size = 0
         truncated = False
@@ -959,6 +1073,7 @@ class EndpointAnalyzer:
         chunks: list[str] = []
         collected_chars = 0
         deadline = time.monotonic() + self.timeout
+        decoder = codecs.getincrementaldecoder("utf-8-sig")("replace")
 
         try:
             for raw in response.iter_content(
@@ -983,19 +1098,16 @@ class EndpointAnalyzer:
 
                 raw_size += len(raw)
 
-                # Keep enough decoded text for structure inference.
                 if collected_chars < BODY_READ_LIMIT:
-                    piece = raw.decode(
-                        "utf-8-sig",
-                        errors="replace",
-                    )
+                    piece = decoder.decode(raw)
                     remaining_chars = (
                         BODY_READ_LIMIT - collected_chars
                     )
                     if len(piece) > remaining_chars:
                         piece = piece[:remaining_chars]
-                    chunks.append(piece)
-                    collected_chars += len(piece)
+                    if piece:
+                        chunks.append(piece)
+                        collected_chars += len(piece)
 
                 if truncated:
                     break
@@ -1009,6 +1121,20 @@ class EndpointAnalyzer:
                 f"{type(exc).__name__}: "
                 f"{self._short(str(exc))}"
             )
+        finally:
+            try:
+                if collected_chars < BODY_READ_LIMIT:
+                    final_piece = decoder.decode(b"", final=True)
+                    remaining_chars = (
+                        BODY_READ_LIMIT - collected_chars
+                    )
+                    if len(final_piece) > remaining_chars:
+                        final_piece = final_piece[:remaining_chars]
+                    if final_piece:
+                        chunks.append(final_piece)
+                        collected_chars += len(final_piece)
+            except Exception:
+                pass
 
         if truncated:
             result["warnings"].append(
@@ -1023,13 +1149,10 @@ class EndpointAnalyzer:
             "headers": headers,
             "content_type": content_type,
             "body": "".join(chunks),
-            # Response size is deliberately a RAW byte count.
             "size": raw_size,
             "truncated": truncated,
             "deadline": deadline_exceeded,
         }
-
-    # -- post-response finalization ------------------------------------------
 
     @staticmethod
     def _status_category(status: int) -> str:
@@ -1076,7 +1199,30 @@ class EndpointAnalyzer:
         )
         result["headers"] = self._extract_headers(headers)
 
-        # Only add path parameters from URLs that were actually requested.
+        options = net.get("options")
+        if options is not None:
+            opt_headers = self._extract_headers(
+                options.get("headers", {})
+            )
+            opt_elapsed = options.get("elapsed_s")
+            result["options_probe"] = {
+                "status": options.get("status"),
+                "headers": opt_headers,
+                "error": options.get("error"),
+                "response_time_ms": (
+                    round(opt_elapsed * 1000, 1)
+                    if opt_elapsed is not None
+                    else None
+                ),
+            }
+            if options.get("error"):
+                result["warnings"].append(
+                    "OPTIONS probe failed: "
+                    f"{options['error'].get('type', 'unknown')}"
+                )
+        else:
+            result["options_probe"] = None
+
         result["parameters"].extend(
             self._path_parameters(final_url)
         )
@@ -1092,6 +1238,9 @@ class EndpointAnalyzer:
             )
 
         result["response_structure"] = struct
+        result["sensitive_findings"] = self._extract_sensitive_findings(
+            body, content_type, result
+        )
 
         if content_type is None:
             result["warnings"].append(
@@ -1110,12 +1259,16 @@ class EndpointAnalyzer:
             "truncated": net["truncated"],
             "deadline": net.get("deadline", False),
             "followed_same_host": len(chain) > 1,
+            "options": result.get("options_probe"),
         }
 
         result["api_behavior"] = (
             self._classify_api_behavior(ctx)
         )
         result["access"] = self._classify_access(ctx)
+        result["security_posture"] = (
+            self._classify_security_posture(ctx)
+        )
 
         if net.get("blocked"):
             result["error"] = {
@@ -1156,6 +1309,16 @@ class EndpointAnalyzer:
             "www-authenticate",
             "location",
             "access-control-allow-origin",
+            "access-control-allow-methods",
+            "access-control-allow-credentials",
+            "strict-transport-security",
+            "x-content-type-options",
+            "x-frame-options",
+            "content-security-policy",
+            "cache-control",
+            "vary",
+            "retry-after",
+            "server-timing",
         )
         out: dict[str, str | None] = {}
 
@@ -1174,13 +1337,11 @@ class EndpointAnalyzer:
 
         return out
 
-    # -- parameters ----------------------------------------------------------
-
     def _extract_parameters(
         self,
         url: str,
     ) -> list[dict[str, Any]]:
-        """Visible query parameters; sensitive values are redacted."""
+        """Visible query parameters."""
         try:
             query = urlsplit(url).query
         except (ValueError, UnicodeError):
@@ -1197,7 +1358,7 @@ class EndpointAnalyzer:
                 continue
             seen.add(name)
 
-            if self._is_sensitive_key(name):
+            if self._is_sensitive_key(name) and self.redact_sensitive:
                 example = REDACTED
             else:
                 example = self._truncate(
@@ -1209,6 +1370,7 @@ class EndpointAnalyzer:
                 "name": name,
                 "location": "query",
                 "example_value": example,
+                "sensitive": self._is_sensitive_key(name),
             })
 
         return params
@@ -1237,6 +1399,8 @@ class EndpointAnalyzer:
                 kind = "possible_identifier"
             elif UUID_SEG_RE.fullmatch(seg):
                 kind = "possible_identifier"
+            elif HEX24_SEG_RE.fullmatch(seg):
+                kind = "possible_identifier"
 
             if kind:
                 out.append({
@@ -1251,8 +1415,6 @@ class EndpointAnalyzer:
                 })
 
         return out
-
-    # -- response structure --------------------------------------------------
 
     def _looks_like_html(self, body: str) -> bool:
         head = body.lstrip()[:200].lower()
@@ -1274,6 +1436,27 @@ class EndpointAnalyzer:
         except Exception:
             return False, None
 
+    @staticmethod
+    def _is_graphql_payload(parsed: Any) -> bool:
+        """Heuristic detection of GraphQL-shaped JSON payloads."""
+        if not isinstance(parsed, dict):
+            return False
+
+        if "__schema" in parsed:
+            return True
+
+        if "data" in parsed and "errors" in parsed:
+            return True
+
+        errors = parsed.get("errors")
+        if isinstance(errors, list) and errors:
+            return any(
+                isinstance(item, dict) and "message" in item
+                for item in errors[:5]
+            )
+
+        return False
+
     def _detect_structure(
         self,
         body: str,
@@ -1281,13 +1464,12 @@ class EndpointAnalyzer:
         net: dict[str, Any],
         result: dict[str, Any],
     ) -> dict[str, Any] | None:
-        """FIRST MATCH WINS response-structure detection."""
+        """Response-structure detection."""
         if body is None:
             return None
 
         stripped = body.strip()
 
-        # 1. empty body
         if not stripped:
             if _is_json_content(content_type):
                 result["warnings"].append(
@@ -1295,14 +1477,12 @@ class EndpointAnalyzer:
                 )
             return {"type": "empty"}
 
-        # 2. binary/static
         if _is_binary_content(content_type):
             return {"type": "binary"}
 
         json_ct = _is_json_content(content_type)
         starts_json = stripped[0] in "{["
 
-        # 3. JSON
         if json_ct or starts_json:
             ok, parsed = self._try_parse_json(
                 stripped
@@ -1316,10 +1496,18 @@ class EndpointAnalyzer:
                         "JSON despite content type "
                         f"{content_type or 'unknown'}"
                     )
-                return self._infer_structure(
+
+                struct = self._infer_structure(
                     parsed,
                     1,
                 )
+
+                if self._is_graphql_payload(parsed):
+                    if isinstance(struct, dict):
+                        struct["api_hint"] = "graphql"
+
+                return struct
+
             if json_ct:
                 if (
                     net["truncated"]
@@ -1335,190 +1523,25 @@ class EndpointAnalyzer:
                 )
                 return {"type": "unknown"}
 
-        # 4. XML
         if (
             _is_xml_content(content_type)
             or stripped.lower().startswith("<?xml")
-            or stripped[:1] == "<"
-            and self._looks_like_xml(stripped)
         ):
-            if net["truncated"] or net["deadline"]:
-                return {"type": "unknown"}
-            struct = None
-            if not self._looks_like_html(stripped):
-                struct = self._parse_xml_structure(stripped)
-            if struct is not None:
-                if (
-                    not _is_xml_content(content_type)
-                    and not stripped.lower().startswith("<?xml")
-                ):
-                    result["warnings"].append(
-                        "XML despite content type "
-                        f"{content_type or 'unknown'}"
-                    )
-                return struct
-            if _is_xml_content(content_type):
-                result["warnings"].append(
-                    "malformed XML"
-                )
-                return {"type": "unknown"}
-            # Angle-bracket body that is actually HTML falls through.
+            return {"type": "xml"}
 
-        # 5. HTML
         if (
             content_type == "text/html"
             or self._looks_like_html(stripped)
         ):
             return {"type": "html"}
 
-        # 6. Text
         if (
             (content_type or "").startswith("text/")
             or content_type in _JS_CSS_TYPES
         ):
             return {"type": "text"}
 
-        # 7. unknown
         return {"type": "unknown"}
-
-    @staticmethod
-    def _looks_like_xml(stripped: str) -> bool:
-        head = stripped[:200].lower()
-        return head.startswith("<") and re.match(
-            r"<\??[a-z_][\w\-.]*[:\s/>?]", head
-        ) is not None
-
-    @staticmethod
-    def _strip_ns(tag: str) -> tuple[str, str | None]:
-        """Split '{namespace}local' -> (local, namespace)."""
-        if tag.startswith("{"):
-            ns, _, local = tag[1:].partition("}")
-            return local, ns or None
-        return tag, None
-
-    def _parse_xml_structure(
-        self, stripped: str
-    ) -> dict[str, Any] | None:
-        """Parse XML body -> detailed structure (None if not XML).
-
-        Uses stdlib ElementTree only (no external entities resolved).
-        Depth capped at MAX_SCHEMA_DEPTH, children capped at
-        MAX_KEYS_PER_OBJECT, mirroring JSON inference.
-        """
-        try:
-            root = ET.fromstring(stripped)
-        except ET.ParseError:
-            return None
-        except (ValueError, MemoryError, RecursionError):
-            return None
-        except Exception:
-            return None
-        local, _ns = self._strip_ns(root.tag)
-        struct: dict[str, Any] = self._infer_xml_element(
-            root, 1
-        )
-        # RSS/Atom feed flag: content syndication, not an API.
-        low = local.lower()
-        if low == "rss" or (
-            low == "feed"
-            and "entry" in (struct.get("children") or {})
-        ):
-            struct["feed"] = "rss" if low == "rss" else "atom"
-        elif low == "feed" and "item" in (
-            struct.get("children") or {}
-        ):
-            struct["feed"] = "rss"
-        # SOAP envelope flag.
-        if low == "envelope":
-            body_child = None
-            fault = False
-            for child in struct.get("children") or {}:
-                if child.lower() == "body":
-                    nested = (struct.get("nested") or {}).get(
-                        child
-                    ) or {}
-                    ops = list(
-                        (nested.get("children") or {}).keys()
-                    )
-                    if ops:
-                        body_child = ops[0]
-                        op_nested = (nested.get("nested") or {}).get(
-                            ops[0]
-                        ) or {}
-                        fault = "fault" in (
-                            op_nested.get("children") or {}
-                        ) or ops[0].lower() == "fault"
-                    break
-            struct["soap"] = True
-            if body_child:
-                struct["operation"] = body_child
-            if fault:
-                struct["fault"] = True
-        return struct
-
-    def _infer_xml_element(
-        self, elem: Any, depth: int
-    ) -> dict[str, Any]:
-        """Recursive XML element inference down to MAX_SCHEMA_DEPTH."""
-        local, ns = self._strip_ns(elem.tag)
-        struct: dict[str, Any] = {
-            "type": "xml",
-            "root": local,
-        }
-        if ns:
-            struct["namespace"] = ns[:MAX_PARAM_EXAMPLE]
-        if elem.attrib:
-            attrs = sorted(str(k).split("}")[-1] for k in elem.attrib)
-            struct["attributes"] = attrs[:MAX_KEYS_PER_OBJECT]
-            if len(attrs) > MAX_KEYS_PER_OBJECT:
-                struct["note"] = (
-                    f"only first {MAX_KEYS_PER_OBJECT} "
-                    "attributes recorded"
-                )
-        counts: dict[str, int] = {}
-        order: list[str] = []
-        for child in list(elem)[: MAX_KEYS_PER_OBJECT * 2]:
-            try:
-                name, _ = self._strip_ns(child.tag)
-            except (ValueError, AttributeError):
-                continue
-            counts[name] = counts.get(name, 0) + 1
-            if name not in order:
-                order.append(name)
-        if order:
-            struct["children"] = {
-                n: counts[n] for n in order[:MAX_KEYS_PER_OBJECT]
-            }
-            repeated = sorted(
-                n for n, c in counts.items() if c > 1
-            )
-            if repeated:
-                struct["repeated"] = repeated[:MAX_KEYS_PER_OBJECT]
-            if depth < MAX_SCHEMA_DEPTH:
-                nested: dict[str, Any] = {}
-                seen: set[str] = set()
-                for child in list(elem):
-                    try:
-                        name, _ = self._strip_ns(child.tag)
-                    except (ValueError, AttributeError):
-                        continue
-                    if name in seen:
-                        continue
-                    seen.add(name)
-                    if len(nested) >= MAX_KEYS_PER_OBJECT:
-                        break
-                    nested[name] = self._infer_xml_element(
-                        child, depth + 1
-                    )
-                    if len(seen) >= MAX_KEYS_PER_OBJECT:
-                        break
-                if nested:
-                    struct["nested"] = nested
-        else:
-            text = (elem.text or "").strip()
-            if text:
-                struct["text"] = text[:MAX_PARAM_EXAMPLE]
-        return struct
 
     def _primitive_type(self, value: Any) -> str:
         if value is None:
@@ -1611,8 +1634,6 @@ class EndpointAnalyzer:
             "type": self._primitive_type(value)
         }
 
-    # -- classification -----------------------------------------------------
-
     def _parsed_container(
         self,
         struct: dict[str, Any] | None,
@@ -1622,16 +1643,129 @@ class EndpointAnalyzer:
             and struct.get("type") in ("object", "array")
         )
 
+    def _normalize_host_set(
+        self,
+        hosts: list[str] | tuple[str, ...] | set[str] | None,
+    ) -> set[str] | None:
+        if hosts is None:
+            return None
+        normalized: set[str] = set()
+        for raw in hosts:
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError("host allowlists must contain non-empty strings")
+            value = raw.strip().lower().rstrip(".")
+            if "://" in value:
+                try:
+                    parsed = urlsplit(value)
+                    value = (parsed.hostname or "").lower().rstrip(".")
+                except (ValueError, UnicodeError):
+                    value = ""
+            if value.startswith("[") and value.endswith("]"):
+                value = value[1:-1]
+            if not value:
+                raise ValueError("invalid host in allowlist")
+            try:
+                value = str(ipaddress.ip_address(value))
+            except ValueError:
+                pass
+            normalized.add(value)
+        return normalized
+
+    @staticmethod
+    def _host_allowed(host: str, allowed: set[str] | None) -> bool:
+        if allowed is None:
+            return True
+        h = host.lower().rstrip(".")
+        return h in allowed
+
+    @staticmethod
+    def _same_site_host(a: str, b: str) -> bool:
+        a = a.lower().rstrip(".")
+        b = b.lower().rstrip(".")
+        if a == b:
+            return True
+        return (
+            a.removeprefix("www.") == b.removeprefix("www.")
+            and (a.startswith("www.") or b.startswith("www."))
+        )
+
+    def _extract_sensitive_findings(
+        self,
+        body: str | None,
+        content_type: str | None,
+        result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Find likely secret-bearing response fields without retaining the whole body."""
+        if not body or not self.inspect_sensitive_response_data:
+            return []
+
+        findings: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(path: str, value: Any, reason: str) -> None:
+            if len(findings) >= self.max_sensitive_findings:
+                return
+            key = (path, reason)
+            if key in seen:
+                return
+            seen.add(key)
+            if self.redact_sensitive:
+                shown: Any = REDACTED
+            elif isinstance(value, (str, int, float, bool)) or value is None:
+                shown = self._truncate(str(value), MAX_SENSITIVE_VALUE)
+            else:
+                shown = f"<{type(value).__name__}>"
+            findings.append({
+                "path": path,
+                "reason": reason,
+                "value": shown,
+            })
+
+        parsed_ok, parsed = self._try_parse_json(body)
+        if parsed_ok:
+            def walk(value: Any, path: str, depth: int = 0) -> None:
+                if len(findings) >= self.max_sensitive_findings or depth > MAX_SCHEMA_DEPTH + 2:
+                    return
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        key_text = str(key)
+                        child_path = f"{path}.{key_text}" if path else key_text
+                        if self._is_sensitive_key(key_text):
+                            add(child_path, child, "sensitive field name")
+                        walk(child, child_path, depth + 1)
+                elif isinstance(value, list):
+                    for idx, child in enumerate(value[:MAX_ARRAY_ITEMS_TO_INSPECT]):
+                        walk(child, f"{path}[{idx}]", depth + 1)
+            walk(parsed, "")
+
+        # Also identify high-confidence token formats in non-JSON text.
+        for pattern in SENSITIVE_VALUE_PATTERNS:
+            if len(findings) >= self.max_sensitive_findings:
+                break
+            for match in pattern.finditer(body):
+                add(f"<text:{match.start()}>", match.group(0), "high-confidence secret pattern")
+                if len(findings) >= self.max_sensitive_findings:
+                    break
+
+        if findings:
+            result["warnings"].append(
+                f"{len(findings)} sensitive response finding(s) detected; response body itself was not stored"
+            )
+        return findings
+
     def _classify_api_behavior(
         self,
         ctx: dict[str, Any],
     ) -> dict[str, Any]:
-        """FIRST MATCH WINS API-behavior classification."""
+        """
+        Weighted API-behavior classification.
+        """
         struct = ctx["struct"]
         ct = ctx["content_type"]
         status = ctx["status"]
         body = ctx["body"]
         headers = ctx["headers"]
+        options = ctx.get("options") or {}
 
         json_ct = _is_json_content(ct)
         container = self._parsed_container(struct)
@@ -1650,14 +1784,35 @@ class EndpointAnalyzer:
             if isinstance(struct, dict)
             else None
         )
+        api_hint = (
+            struct.get("api_hint")
+            if isinstance(struct, dict)
+            else None
+        )
+
+        scores = {
+            "confirmed": 0,
+            "likely": 0,
+            "uncertain": 0,
+            "unlikely": 0,
+        }
+        evidence: list[str] = []
+
+        def add(
+            classification: str,
+            weight: int,
+            message: str,
+        ) -> None:
+            scores[classification] += weight
+            evidence.append(
+                f"{classification} +{weight}: {message}"
+            )
 
         if stype is None:
-            return self._behavior(
+            add(
                 "uncertain",
-                [
-                    "1: request failed or response body "
-                    "unavailable"
-                ],
+                100,
+                "request failed or response body unavailable",
             )
 
         if (
@@ -1665,135 +1820,125 @@ class EndpointAnalyzer:
             and json_ct
             and status not in (404, 410)
         ):
-            return self._behavior(
+            add(
                 "confirmed",
-                [
-                    f"2: JSON {stype} returned with JSON "
-                    f"content type (status {status})"
-                ],
+                100,
+                f"JSON {stype} returned with JSON content type "
+                f"(status {status})",
             )
 
+        if api_hint == "graphql":
+            if json_ct:
+                add(
+                    "confirmed",
+                    45,
+                    "GraphQL-style JSON payload detected",
+                )
+            else:
+                add(
+                    "likely",
+                    35,
+                    "GraphQL-style payload without JSON content type",
+                )
+
         if container and status in (404, 410):
-            return self._behavior(
+            add(
                 "likely",
-                [
-                    f"3: JSON {stype} returned with "
-                    f"error status {status}"
-                ],
+                75,
+                f"JSON {stype} returned with error status {status}",
             )
 
         if primitive_json:
-            return self._behavior(
+            add(
                 "likely",
-                [
-                    "4: JSON primitive with JSON "
-                    "content type"
-                ],
+                60,
+                "JSON primitive with JSON content type",
             )
 
+        looks_json = (
+            isinstance(body, str)
+            and body.lstrip()[:1] in "{["
+        )
         if (
             (ctx["truncated"] or ctx.get("deadline"))
-            and (
-                json_ct
-                or (
-                    isinstance(body, str)
-                    and body.lstrip()[:1] in "{["
-                )
-            )
+            and (json_ct or looks_json)
         ):
-            return self._behavior(
+            add(
                 "likely",
-                [
-                    "5: body truncated while looking "
-                    "like JSON"
-                ],
+                55,
+                "body truncated while looking like JSON",
             )
 
         if json_ct and stype == "unknown":
-            return self._behavior(
+            add(
                 "likely",
-                [
-                    "6: JSON content type but body "
-                    "could not be parsed"
-                ],
-            )
-
-        if _is_xml_content(ct) and stype == "unknown":
-            return self._behavior(
-                "likely",
-                [
-                    "6b: XML content type but body "
-                    "could not be parsed"
-                ],
+                50,
+                "JSON content type but body could not be parsed",
             )
 
         if json_ct and stype == "empty":
-            return self._behavior(
+            add(
                 "uncertain",
-                [
-                    "7: JSON content type with empty body"
-                ],
+                35,
+                "JSON content type with empty body",
             )
 
         if container and not json_ct:
-            return self._behavior(
+            add(
                 "likely",
-                [
-                    f"8: JSON {stype} served with "
-                    "non-JSON content type"
-                ],
+                55,
+                f"JSON {stype} served with non-JSON content type",
             )
+
+        opt_status = options.get("status")
+        opt_headers = options.get("headers") or {}
+        opt_allow = opt_headers.get("allow") or ""
+        opt_acam = opt_headers.get(
+            "access-control-allow-methods"
+        ) or ""
+
+        if opt_status in (200, 204) and (opt_allow or opt_acam):
+            add(
+                "likely",
+                85,
+                f"OPTIONS probe returned {opt_status} with allowed methods",
+            )
+
+            methods: set[str] = set()
+            for value in (
+                opt_allow,
+                opt_acam,
+                headers.get("allow"),
+            ):
+                if not value:
+                    continue
+                for item in str(value).split(","):
+                    item = item.strip().upper()
+                    if item:
+                        methods.add(item)
+
+            if methods - {"GET", "HEAD", "OPTIONS"}:
+                add(
+                    "confirmed",
+                    20,
+                    "OPTIONS probe advertises non-GET methods",
+                )
 
         if (
             stype == "binary"
             or ct in _JS_CSS_TYPES
         ):
-            return self._behavior(
+            add(
                 "unlikely",
-                [
-                    "9: static/binary or "
-                    "JavaScript/CSS response"
-                ],
+                100,
+                "static/binary or JavaScript/CSS response",
             )
 
         if stype == "xml":
-            feed = struct.get("feed") if isinstance(
-                struct, dict
-            ) else None
-            if feed:
-                return self._behavior(
-                    "uncertain",
-                    [
-                        f"10: {feed.upper()} feed response, "
-                        "not an API"
-                    ],
-                )
-            root = struct.get("root") if isinstance(
-                struct, dict
-            ) else None
-            detail = f" (root <{root}>)" if root else ""
-            if isinstance(struct, dict) and struct.get("fault"):
-                op = struct.get("operation")
-                return self._behavior(
-                    "likely",
-                    [
-                        "10: SOAP fault response"
-                        + (f" (operation {op})" if op else "")
-                    ],
-                )
-            if isinstance(struct, dict) and struct.get("soap"):
-                op = struct.get("operation")
-                return self._behavior(
-                    "likely",
-                    [
-                        "10: SOAP envelope response"
-                        + (f" (operation {op})" if op else "")
-                        + detail
-                    ],
-                )
-            return self._behavior(
+            add(
                 "likely",
-                [f"10: XML response{detail}"],
+                65,
+                "XML response",
             )
 
         if (
@@ -1804,22 +1949,23 @@ class EndpointAnalyzer:
                 or headers.get("allow")
             )
         ):
-            evidence = [
-                f"11: status {status} with "
-                "machine-readable error response"
-            ]
+            add(
+                "likely",
+                80,
+                f"status {status} with machine-readable API signal",
+            )
             if headers.get("www-authenticate"):
-                evidence.append(
-                    "11: WWW-Authenticate header present"
+                add(
+                    "likely",
+                    10,
+                    "WWW-Authenticate header present",
                 )
             if headers.get("allow"):
-                evidence.append(
-                    "11: Allow header present"
+                add(
+                    "likely",
+                    10,
+                    "Allow header present",
                 )
-            return self._behavior(
-                "likely",
-                evidence,
-            )
 
         if (
             ctx["followed_same_host"]
@@ -1827,33 +1973,53 @@ class EndpointAnalyzer:
                 self._path_of(ctx["final_url"])
             )
         ):
-            return self._behavior(
+            add(
                 "uncertain",
-                [
-                    "12: redirected to a login/"
-                    "authentication path"
-                ],
+                65,
+                "redirected to a login/authentication path",
             )
 
         if status in (401, 403, 405):
-            return self._behavior(
+            add(
                 "uncertain",
-                [
-                    f"13: status {status} indicates "
-                    "restricted access"
-                ],
+                45,
+                f"status {status} indicates restricted access",
             )
 
         if stype == "html":
-            return self._behavior(
-                "unlikely",
-                ["14: HTML page response"],
+            if status in (401, 403, 405):
+                add(
+                    "uncertain",
+                    70,
+                    "HTML response with restricted status",
+                )
+            else:
+                add(
+                    "unlikely",
+                    95,
+                    "HTML page response",
+                )
+
+        if stype == "text":
+            add(
+                "uncertain",
+                25,
+                "plain text or static text-like response",
             )
 
-        return self._behavior(
-            "uncertain",
-            ["15: insufficient evidence to classify"],
+        if not evidence:
+            add(
+                "uncertain",
+                1,
+                "insufficient evidence to classify",
+            )
+
+        order = ("confirmed", "likely", "uncertain", "unlikely")
+        best = max(
+            order,
+            key=lambda name: (scores[name], -order.index(name)),
         )
+        return self._behavior(best, evidence)
 
     @staticmethod
     def _behavior(
@@ -1871,39 +2037,61 @@ class EndpointAnalyzer:
         except (ValueError, UnicodeError):
             return ""
 
+    def _scheme_of(self, url: str) -> str:
+        try:
+            return urlsplit(url).scheme.lower()
+        except (ValueError, UnicodeError):
+            return ""
+
     def _classify_access(
         self,
         ctx: dict[str, Any],
     ) -> dict[str, Any]:
-        """FIRST MATCH WINS access classification."""
+        """Weighted access classification."""
         status = ctx["status"]
         headers = ctx["headers"]
+
+        scores = {
+            "authentication_required": 0,
+            "forbidden": 0,
+            "public": 0,
+            "unknown": 0,
+        }
+        evidence: list[str] = []
+
+        def add(
+            classification: str,
+            weight: int,
+            message: str,
+        ) -> None:
+            scores[classification] += weight
+            evidence.append(
+                f"{classification} +{weight}: {message}"
+            )
 
         if (
             status == 401
             or headers.get("www-authenticate")
         ):
-            ev = []
             if status == 401:
-                ev.append(
-                    "1: status 401 Unauthorized"
+                add(
+                    "authentication_required",
+                    100,
+                    "status 401 Unauthorized",
                 )
             if headers.get("www-authenticate"):
-                ev.append(
-                    "1: WWW-Authenticate header present"
+                add(
+                    "authentication_required",
+                    20,
+                    "WWW-Authenticate header present",
                 )
-            return {
-                "classification": "authentication_required",
-                "evidence": ev,
-            }
 
         if status == 403:
-            return {
-                "classification": "forbidden",
-                "evidence": [
-                    "2: status 403 Forbidden"
-                ],
-            }
+            add(
+                "forbidden",
+                95,
+                "status 403 Forbidden",
+            )
 
         if (
             ctx["followed_same_host"]
@@ -1911,31 +2099,117 @@ class EndpointAnalyzer:
                 self._path_of(ctx["final_url"])
             )
         ):
-            return {
-                "classification": "authentication_required",
-                "evidence": [
-                    "3: redirected to a login/"
-                    "authentication path"
-                ],
-            }
+            add(
+                "authentication_required",
+                85,
+                "redirected to a login/authentication path",
+            )
 
         if 200 <= status < 300:
-            return {
-                "classification": "public",
-                "evidence": [
-                    "4: 2xx response without "
-                    "supplied credentials"
-                ],
-            }
+            add(
+                "public",
+                80,
+                "2xx response without supplied credentials",
+            )
+
+        if not evidence:
+            add(
+                "unknown",
+                1,
+                "no access signal matched",
+            )
+
+        order = (
+            "authentication_required",
+            "forbidden",
+            "public",
+            "unknown",
+        )
+        best = max(
+            order,
+            key=lambda name: (scores[name], -order.index(name)),
+        )
 
         return {
-            "classification": "unknown",
-            "evidence": [
-                "5: no access signal matched"
-            ],
+            "classification": best,
+            "evidence": evidence,
         }
 
-    # -- result scaffolding -------------------------------------------------
+    def _classify_security_posture(
+        self,
+        ctx: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Context-aware passive security-header/CORS posture observations."""
+        headers = ctx["headers"]
+        final_url = ctx["final_url"]
+        scheme = self._scheme_of(final_url)
+        struct = ctx.get("struct") or {}
+        is_html = struct.get("type") == "html"
+        is_browser_facing = is_html or ctx.get("status") in (401, 403)
+
+        issues: list[str] = []
+        evidence: list[str] = []
+        observations: list[str] = []
+
+        acao = (headers.get("access-control-allow-origin") or "").strip()
+        acac = (headers.get("access-control-allow-credentials") or "").strip().lower() == "true"
+        if acao == "*":
+            observations.append("CORS wildcard origin is enabled")
+            if acac:
+                issues.append("cors_wildcard_with_credentials_signal")
+                evidence.append(
+                    "Access-Control-Allow-Origin is '*' and credentials are advertised; browsers normally reject credentialed wildcard CORS"
+                )
+
+        if acao and acao != "*":
+            observations.append(f"CORS allows explicit origin: {self._truncate(acao, MAX_HEADER_VALUE)}")
+
+        hsts = headers.get("strict-transport-security")
+        if scheme == "https":
+            if hsts:
+                observations.append("HSTS is present on HTTPS response")
+            else:
+                issues.append("missing_hsts")
+                evidence.append("HTTPS response is missing Strict-Transport-Security")
+
+        xcto = (headers.get("x-content-type-options") or "").strip().lower()
+        if xcto == "nosniff":
+            observations.append("X-Content-Type-Options: nosniff")
+        elif is_browser_facing:
+            issues.append("missing_or_invalid_x_content_type_options")
+            evidence.append("browser-facing response is missing X-Content-Type-Options: nosniff")
+
+        if is_browser_facing:
+            if headers.get("content-security-policy"):
+                observations.append("Content-Security-Policy is present")
+            else:
+                issues.append("missing_csp")
+                evidence.append("browser-facing response is missing Content-Security-Policy")
+
+            if headers.get("x-frame-options"):
+                observations.append("X-Frame-Options is present")
+            else:
+                issues.append("missing_x_frame_options")
+                evidence.append("browser-facing response is missing X-Frame-Options")
+
+        if headers.get("cache-control"):
+            observations.append(f"Cache-Control: {self._truncate(headers['cache-control'], MAX_HEADER_VALUE)}")
+
+        if issues:
+            classification = "risky" if any("cors_" in i for i in issues) else "needs_review"
+        elif scheme == "https":
+            classification = "hardened"
+            evidence.append("No basic passive security-header issue was observed")
+        else:
+            classification = "unknown"
+            evidence.append("Passive header checks did not establish a hardened HTTPS posture")
+
+        return {
+            "classification": classification,
+            "issues": issues,
+            "observations": observations,
+            "evidence": evidence,
+        }
 
     @staticmethod
     def _new_result() -> dict[str, Any]:
@@ -1963,7 +2237,14 @@ class EndpointAnalyzer:
                 "www-authenticate": None,
                 "location": None,
                 "access-control-allow-origin": None,
+                "access-control-allow-methods": None,
+                "access-control-allow-credentials": None,
+                "strict-transport-security": None,
+                "x-content-type-options": None,
+                "x-frame-options": None,
+                "content-security-policy": None,
             },
+            "options_probe": None,
             "api_behavior": {
                 "classification": "uncertain",
                 "evidence": [],
@@ -1972,14 +2253,17 @@ class EndpointAnalyzer:
                 "classification": "unknown",
                 "evidence": [],
             },
+            "security_posture": {
+                "classification": "unknown",
+                "issues": [],
+                "observations": [],
+                "evidence": [],
+            },
+            "sensitive_findings": [],
             "warnings": [],
             "error": None,
         }
 
-
-# ---------------------------------------------------------------------------
-# Convenience function and minimal entry point
-# ---------------------------------------------------------------------------
 
 def analyze_discovery_file(
     input_path: str,
