@@ -100,11 +100,12 @@ Every candidate looks like this — so you always know *why* something was flagg
 
 Each endpoint gets one safe GET (sensitive query values are blanked before sending, redirects stay same-host, bodies are size-capped) and comes back with:
 
-- **Basics** — `method`, `status`, `status_category`, `content_type`, `response_time_ms`, `response_size`, `final_url` + `redirect_chain`, selected headers
+- **Basics** — `method`, `status`, `status_category`, `content_type`, `response_time_ms`, `response_size`, `final_url` + `redirect_chain`, selected headers (incl. `x-content-type-options`, `x-frame-options` observations)
 - **Shape** — `parameters` (query + numeric/UUID path IDs), `response_structure` (inferred JSON keys/nested/item types; XML/SOAP element tree with RSS/Atom feed and SOAP-fault flags; `html` / `text` / `binary` / `empty` / `unknown`)
 - **Verdict** — `api_behavior`: `confirmed` ✅ / `likely` / `uncertain` / `unlikely`, each with human-readable evidence
 - **Exposure** — `access`: `public` 🌐 / `authentication_required` / `forbidden` / `unknown`
 - **Honesty** — `warnings` and per-endpoint `error` objects; one bad URL never kills the batch
+- **OPTIONS probe** — on a 405 GET, one lightweight `OPTIONS` request follows (no redirects/body) to capture `Allow` methods for the verdict; recorded as `options_probe: {status, error}`. Disable with `EndpointAnalyzer(options_probe=False)`.
 
 ---
 
@@ -145,7 +146,7 @@ Real-time SSE scan: sites-crawled + endpoints-found scroll boxes, click an endpo
 ## 🚧 Known limitations
 
 - The crawler follows `<a href>` links only — JS-rendered SPAs yield few pages (discovery's same-origin script scan compensates).
-- Analysis sends GET requests only — POST/PUT/DELETE endpoints are judged by their GET behavior.
+- Analysis is GET-first with one conditional `OPTIONS` probe on 405 — POST/PUT/DELETE endpoints are otherwise judged by their GET behavior.
 - Template-literal extraction covers inline scripts only; external `<script src>` bundles aren't scanned for backtick URLs (discovery's `javascript` source still regexes them for quoted API strings, same-origin only).
 
 ---
