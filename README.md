@@ -47,8 +47,14 @@ python crawler.py https://example.com/ --analyze --max-pages 20
 # Be polite — wait N seconds between requests so you don't hammer the site
 python crawler.py https://example.com/ --analyze --delay 1
 
-# Use the bundled 200-entry wordlist instead of the built-in 16
+# Use the bundled 200-entry wordlist (opt-in, no default brute-forcing)
 python crawler.py http://10.49.149.174/ --analyze --wordlist common_wordlist.txt -v
+
+# Fuzz query params on API candidates (?id=1..N, boundaries 0/-1/99999/abc, bare-path ?id/?page/...)
+python crawler.py http://localhost:8000/ --analyze --enum-ids 5
+
+# Force a port (useful for bare IP/host targets, overrides any port in the URL)
+python crawler.py 10.49.149.174 -p 8080 --analyze
 
 # Try it against OWASP Juice Shop
 python crawler.py http://localhost:3000/ --analyze -o results.json
@@ -61,7 +67,9 @@ python crawler.py http://localhost:3000/ --analyze -o results.json
 | `-o FILE` | Write the report to `FILE` instead of stdout |
 | `--max-pages N` | Stop crawling after `N` pages (default: 50) |
 | `--delay SECONDS` | Wait N seconds between requests to avoid bombarding the site (default: 0) |
-| `--wordlist FILE` | Extra wordlist file (one path per line, `#` comments ignored); e.g. `--wordlist common_wordlist.txt` |
+| `--wordlist FILE` | Extra wordlist file (one path per line, `#` comments ignored); e.g. `--wordlist common_wordlist.txt`. Wordlist probing is opt-in only — no built-in default. |
+| `--enum-ids N` | Fuzz query params: enumerate numeric values `1..N`, boundary/type probes (`0`, `-1`, `99999`, `abc`), probe common params on bare API endpoints. `0` disables (default: `0`). |
+| `-p PORT`, `--port PORT` | Force port on target URL (e.g. `-p 8080`); overrides any port already in the URL. Useful for bare IP/host targets. |
 | `-v` | Show each wordlist path as it is checked |
 
 ---
@@ -75,7 +83,7 @@ One call — `discover_endpoints(crawl_records, target_url)` — fuses four sour
 | `crawler` | Passive filter over crawled pages — `/api/`, `/v1/`, `/v2/`, `/graphql`, `.json` URLs, JSON content types |
 | `javascript` | Statically scans same-origin `<script>` files for API strings (`fetch`, `axios`, …). Nothing is executed |
 | `openapi` / `swagger` | Probes known spec locations (`/openapi.json`, `/api-docs`, …) and extracts `paths` keys |
-| `common_path` | A tight 16-entry built-in wordlist (`/api/users`, `/graphql`, …) checked with GET only — extend with `--wordlist common_wordlist.txt` (200 entries) |
+| `common_path` | Opt-in wordlist only (no built-in default, GET only) — supply via `--wordlist common_wordlist.txt` (200 entries) or `extra_paths=`; skipped silently when no wordlist is given |
 
 Every candidate looks like this — so you always know *why* something was flagged:
 
@@ -109,7 +117,7 @@ python -m pytest test_endpoint_discovery.py -q      # unit tests — pure mocks,
 
 - Template-literal URLs (e.g. `` `/api/products/${id}/price` `` in inline scripts) are extracted, `${...}` is normalized to `1`, and added as crawl records so discovery flags them.
 - HTTP redirects are canonicalized: the **final** URL is recorded, so links that bounce to `/` don't create duplicate homepage entries.
-- Fragment-only links (`page.html#menu` vs `page.html#`) currently still enter the queue separately — strip `#` fragments before queuing if this litters your output.
+- Fragment-only links (`page.html#menu` vs `page.html#`) are normalized (`#` stripped) before queuing/visiting, so anchors never create duplicate pages or extra requests.
 
 ---
 
