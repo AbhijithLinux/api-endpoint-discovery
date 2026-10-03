@@ -3,7 +3,7 @@ import time
 
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 # Template-literal URL extraction (e.g. `/api/products/${id}/price`).
 # Scans backtick blocks in raw HTML (inline scripts) for API-ish paths,
@@ -17,6 +17,47 @@ _TEMPLATE_PATH_RE = re.compile(
 )
 _INTERPOLATION_RE = re.compile(r"\$\{[^}]*\}")
 _JS_HINTS = ("/api", "/v1/", "/v2/", "/rest/", "/graphql")
+
+
+def validate_port(raw):
+    """Coerce a --port value to an int in 1-65535, or raise ValueError."""
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("--port must be an integer between 1 and 65535")
+    if not 1 <= port <= 65535:
+        raise ValueError("--port must be between 1 and 65535")
+    return port
+
+
+def apply_port(url, port):
+    """Return `url` with its authority port forced to `port`.
+
+    Handles bare hosts ("10.0.0.1"), hosts that already carry a port, and
+    IPv6 literals with or without brackets. Userinfo, path, query and
+    fragment are preserved; an explicit --port always wins over the port
+    already present in the URL.
+    """
+    if port is None:
+        return url
+
+    parts = urlsplit(url)
+    userinfo, _, hostport = parts.netloc.rpartition("@")
+
+    if hostport.startswith("["):
+        host = hostport.partition("]")[0] + "]"
+    elif hostport.count(":") > 1:
+        host = "[" + hostport + "]"
+    else:
+        host = hostport.partition(":")[0]
+
+    if not host:
+        return url
+
+    authority = f"{userinfo}@{host}:{port}" if userinfo else f"{host}:{port}"
+    return urlunsplit(
+        (parts.scheme, authority, parts.path, parts.query, parts.fragment)
+    )
 
 
 def fetch_page(url):
@@ -245,6 +286,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Crawl a site and discover API endpoints.")
     parser.add_argument("url", nargs="?", help="Target URL (e.g. http://localhost:8000/)")
+    parser.add_argument("-p", "--port", type=int, default=None, help="Port to scan when the target is given as a bare IP or host (e.g. -p 8080); overrides any port in the URL")
     parser.add_argument("--analyze", action="store_true", help="Run endpoint analysis on discovered candidates")
     parser.add_argument("-o", "--output", default=None, help="Write analysis JSON to file")
     parser.add_argument("--max-pages", type=int, default=50, help="Max pages to crawl (default: 50)")
@@ -257,11 +299,22 @@ if __name__ == "__main__":
     start_url = args.url or input("Enter start URL: ").strip()
 
     if not start_url:
-        print("No URL provided. Usage: python crawler.py <start_url> [--analyze] [-o out.json]")
+        print("No URL provided. Usage: python crawler.py <start_url> [-p PORT] [--analyze] [-o out.json]")
         raise SystemExit(1)
 
     if not start_url.startswith(("http://", "https://")):
         start_url = "http://" + start_url
+
+    if args.port is not None:
+        try:
+            args.port = validate_port(args.port)
+        except ValueError as e:
+            print(e)
+            raise SystemExit(1)
+        scoped = apply_port(start_url, args.port)
+        if scoped != start_url:
+            print(f"Target port: {args.port} -> {scoped}")
+        start_url = scoped
 
     records = crawl(start_url, max_pages=args.max_pages, delay=args.delay)
 
