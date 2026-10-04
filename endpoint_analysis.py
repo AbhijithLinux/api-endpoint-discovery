@@ -96,6 +96,117 @@ _JS_CSS_TYPES = {
     "text/css",
 }
 
+# Opening tags that identify an HTML document. Deliberately excludes very
+# generic names (<p>, <a>, <h1>) so plain text quoting them is not misread
+# as a page.
+_HTML_OPEN_TAG_RE = re.compile(
+    r"<(?:!doctype\s+html|html|head|body|meta|title|div|span|section|main|"
+    r"nav|header|footer|article|aside|script|link|iframe|form|table|"
+    r"ul|ol|li|img|video|audio)\b",
+    re.I,
+)
+
+# Short, ambiguous names match only as a whole parameter name, so
+# ?keyword= / ?zipcode= / ?residence= are not mistaken for secrets.
+# Longer names stay substring matches ("*_token", "client_secret", ...).
+_SENSITIVE_EXACT_NAMES = frozenset({
+    "key", "keys", "code", "sid", "sig", "auth", "pwd", "passwd",
+})
+_SENSITIVE_SUBSTRINGS = tuple(
+    # Patterns are normalized the same way the key is (see _is_sensitive_key),
+    # otherwise "_" inside "private_key" can never match anything.
+    p.replace("_", "")
+    for p in SENSITIVE_PATTERNS
+    if p not in _SENSITIVE_EXACT_NAMES
+)
+
+
+def _verdict(
+    key: str,
+    label: str,
+    summary: str,
+    next_step: str,
+) -> dict[str, str]:
+    """Build the human-facing verdict object attached to every result."""
+    return {
+        "key": key,
+        "label": label,
+        "summary": summary,
+        "next_step": next_step,
+    }
+
+
+# What to tell someone to do next, once we know how the endpoint is gated.
+_ACCESS_NEXT_STEP = {
+    "public": "Send a plain read request yourself — no credentials needed.",
+    "authentication_required": (
+        "Repeat the request with credentials to see the real response."
+    ),
+    "forbidden": (
+        "This needs an account or a permission your token does not carry."
+    ),
+    "unknown": "Send the request yourself and read what comes back.",
+}
+
+_DOWN = (
+    "unreachable",
+    "Site is down — nothing answered",
+    "The server could not be reached, so nothing can be said about this path.",
+    "Check the address and your network, then confirm the site is online.",
+)
+
+# Error types that all mean "the request never got an answer".
+_VERDICT_BY_ERROR = {
+    "connection_error": _DOWN,
+    "request_error": _DOWN,
+    "unexpected_error": _DOWN,
+    "timeout": (
+        "timeout",
+        "Site is up but too slow to answer",
+        "The server accepted the connection but did not reply in time.",
+        "Retry with a longer timeout, or check whether the site is overloaded.",
+    ),
+    "ssl_error": (
+        "tls_problem",
+        "Site is up but the secure connection failed",
+        "The certificate or TLS setup did not validate, so the request was abandoned.",
+        "Retry with verify_ssl=False to inspect the endpoint anyway.",
+    ),
+    "blocked_redirect": (
+        "offsite_redirect",
+        "Redirect leaves this site",
+        "The server points visitors at a different site, so the analyzer "
+        "stopped rather than following it off-target.",
+        "Open the redirect target yourself if you trust it, then analyze "
+        "that address directly.",
+    ),
+    "too_many_redirects": (
+        "redirect_loop",
+        "Redirects never settle",
+        "The server kept redirecting and never actually served this path.",
+        "Open the address in a browser to see where the redirects end up.",
+    ),
+    "unsupported_scheme": (
+        "not_checkable",
+        "Not checked — not a web address",
+        "Only http and https addresses can be requested, so nothing was sent.",
+        "Use an http or https address for this endpoint.",
+    ),
+    "invalid_url": (
+        "not_checkable",
+        "Not checked — the address could not be read",
+        "This address could not be parsed, so no request was made.",
+        "Check the address for typos or escaped characters.",
+    ),
+    "host_not_allowed": (
+        "not_checkable",
+        "Not checked — this host is outside the allowed list",
+        "The analyzer is restricted to certain hosts and this one is not "
+        "among them.",
+        "Add the host to allowed_hosts if you really want it scanned.",
+    ),
+}
+
 
 def _is_binary_content(ct: str | None) -> bool:
     """True for binary/static asset media types."""
@@ -220,6 +331,9 @@ class EndpointAnalyzer:
                 "type": "unexpected_error",
                 "message": f"{type(exc).__name__}: {exc}",
             }
+        # Built here, not in _analyze_into, so every exit path — success,
+        # blocked redirect, unparseable URL — carries a verdict too.
+        result["verdict"] = self._build_verdict(result)
         return result
 
     def analyze_candidates(self, candidates: Any) -> list[dict[str, Any]]:
@@ -508,7 +622,9 @@ class EndpointAnalyzer:
         except Exception:
             decoded = key
         norm = decoded.lower().replace("-", "").replace("_", "")
-        return any(p in norm for p in SENSITIVE_PATTERNS)
+        if norm in _SENSITIVE_EXACT_NAMES:
+            return True
+        return any(p in norm for p in _SENSITIVE_SUBSTRINGS)
 
     def _sanitize_query(
         self,
@@ -1032,7 +1148,14 @@ class EndpointAnalyzer:
             oscheme, ohost, oport = origin
 
             same_site = self._same_site_host(thost, ohost)
-            explicitly_allowed = self._host_allowed(thost, self.allowed_redirect_hosts)
+            # _host_allowed() returns True when no allowlist is configured,
+            # so `explicitly_allowed` must be gated on the allowlist existing
+            # — otherwise every cross-host redirect counts as "explicitly
+            # allowed" and the same-site guard never fires.
+            explicitly_allowed = (
+                self.allowed_redirect_hosts is not None
+                and self._host_allowed(thost, self.allowed_redirect_hosts)
+            )
             if not same_site and not explicitly_allowed:
                 return None, "redirect target is on a different host"
 
@@ -1417,11 +1540,14 @@ class EndpointAnalyzer:
         return out
 
     def _looks_like_html(self, body: str) -> bool:
-        head = body.lstrip()[:200].lower()
-        return (
-            head.startswith("<!doctype html")
-            or head.startswith("<html")
-        )
+        """True when the body looks like an HTML document.
+
+        Tolerant of the leading noise real pages carry (comments, XML
+        declarations, stray whitespace): a strict "<!doctype html" prefix
+        test misses most real pages, and every miss turns a perfectly
+        ordinary web page into "unclassifiable".
+        """
+        return bool(_HTML_OPEN_TAG_RE.search(body.lstrip()[:512]))
 
     def _try_parse_json(
         self,
@@ -1803,16 +1929,16 @@ class EndpointAnalyzer:
             weight: int,
             message: str,
         ) -> None:
+            # Scores stay internal. The evidence list is shown to people, so
+            # it holds plain sentences only — no rule numbers, no weights.
             scores[classification] += weight
-            evidence.append(
-                f"{classification} +{weight}: {message}"
-            )
+            evidence.append(message)
 
         if stype is None:
             add(
                 "uncertain",
                 100,
-                "request failed or response body unavailable",
+                "No response came back, so there is nothing to judge.",
             )
 
         if (
@@ -1823,8 +1949,8 @@ class EndpointAnalyzer:
             add(
                 "confirmed",
                 100,
-                f"JSON {stype} returned with JSON content type "
-                f"(status {status})",
+                f"The server returned a structured {stype} in the "
+                "standard JSON format.",
             )
 
         if api_hint == "graphql":
@@ -1832,32 +1958,34 @@ class EndpointAnalyzer:
                 add(
                     "confirmed",
                     45,
-                    "GraphQL-style JSON payload detected",
+                    "The payload is shaped like a GraphQL query result.",
                 )
             else:
                 add(
                     "likely",
                     35,
-                    "GraphQL-style payload without JSON content type",
+                    "The payload looks like GraphQL but was not sent as JSON.",
                 )
 
         if container and status in (404, 410):
             add(
                 "likely",
                 75,
-                f"JSON {stype} returned with error status {status}",
+                "The server returned structured data wrapped in an error.",
             )
 
         if primitive_json:
             add(
                 "likely",
                 60,
-                "JSON primitive with JSON content type",
+                "The server returned a single bare value rather than a record.",
             )
 
+        # NOTE: `"" in "{["` is True, so test the first character itself —
+        # an empty body must not count as "looks like JSON".
         looks_json = (
             isinstance(body, str)
-            and body.lstrip()[:1] in "{["
+            and body.lstrip()[:1] in ("{", "[")
         )
         if (
             (ctx["truncated"] or ctx.get("deadline"))
@@ -1866,28 +1994,28 @@ class EndpointAnalyzer:
             add(
                 "likely",
                 55,
-                "body truncated while looking like JSON",
+                "The response was cut off part-way, but it began like JSON.",
             )
 
         if json_ct and stype == "unknown":
             add(
                 "likely",
                 50,
-                "JSON content type but body could not be parsed",
+                "The server called this JSON but the content was malformed.",
             )
 
         if json_ct and stype == "empty":
             add(
                 "uncertain",
                 35,
-                "JSON content type with empty body",
+                "The server promised JSON but sent an empty body.",
             )
 
         if container and not json_ct:
             add(
                 "likely",
                 55,
-                f"JSON {stype} served with non-JSON content type",
+                "The server sent structured data but mislabelled the format.",
             )
 
         opt_status = options.get("status")
@@ -1901,7 +2029,8 @@ class EndpointAnalyzer:
             add(
                 "likely",
                 85,
-                f"OPTIONS probe returned {opt_status} with allowed methods",
+                "The server turned down a plain read but listed the "
+                "methods it does accept.",
             )
 
             methods: set[str] = set()
@@ -1921,7 +2050,8 @@ class EndpointAnalyzer:
                 add(
                     "confirmed",
                     20,
-                    "OPTIONS probe advertises non-GET methods",
+                    "The accepted methods include writes, so this "
+                    "endpoint expects more than a read.",
                 )
 
         if (
@@ -1931,14 +2061,15 @@ class EndpointAnalyzer:
             add(
                 "unlikely",
                 100,
-                "static/binary or JavaScript/CSS response",
+                "This is a static asset such as an image, script or "
+                "stylesheet.",
             )
 
         if stype == "xml":
             add(
                 "likely",
                 65,
-                "XML response",
+                "The server returned an XML document, which APIs often use.",
             )
 
         if (
@@ -1952,19 +2083,21 @@ class EndpointAnalyzer:
             add(
                 "likely",
                 80,
-                f"status {status} with machine-readable API signal",
+                "The server blocked the request but answered in a way "
+                "programs understand.",
             )
             if headers.get("www-authenticate"):
                 add(
                     "likely",
                     10,
-                    "WWW-Authenticate header present",
+                    "The response carries a WWW-Authenticate header.",
                 )
             if headers.get("allow"):
                 add(
                     "likely",
                     10,
-                    "Allow header present",
+                    "The response carries an Allow header listing "
+                    "accepted methods.",
                 )
 
         if (
@@ -1976,14 +2109,14 @@ class EndpointAnalyzer:
             add(
                 "uncertain",
                 65,
-                "redirected to a login/authentication path",
+                "Visitors are redirected to a login or sign-in page.",
             )
 
         if status in (401, 403, 405):
             add(
                 "uncertain",
                 45,
-                f"status {status} indicates restricted access",
+                "The server refused to serve this without credentials.",
             )
 
         if stype == "html":
@@ -1991,27 +2124,29 @@ class EndpointAnalyzer:
                 add(
                     "uncertain",
                     70,
-                    "HTML response with restricted status",
+                    "An ordinary web page came back, but only after the "
+                    "server refused access.",
                 )
             else:
                 add(
                     "unlikely",
                     95,
-                    "HTML page response",
+                    "This is an ordinary HTML web page, not a data endpoint.",
                 )
 
         if stype == "text":
             add(
                 "uncertain",
                 25,
-                "plain text or static text-like response",
+                "The response is plain text with nothing machine-readable "
+                "in it.",
             )
 
         if not evidence:
             add(
                 "uncertain",
                 1,
-                "insufficient evidence to classify",
+                "Nothing in the response clearly marks this as an API.",
             )
 
         order = ("confirmed", "likely", "uncertain", "unlikely")
@@ -2065,9 +2200,7 @@ class EndpointAnalyzer:
             message: str,
         ) -> None:
             scores[classification] += weight
-            evidence.append(
-                f"{classification} +{weight}: {message}"
-            )
+            evidence.append(message)
 
         if (
             status == 401
@@ -2077,20 +2210,21 @@ class EndpointAnalyzer:
                 add(
                     "authentication_required",
                     100,
-                    "status 401 Unauthorized",
+                    "The server will not answer until you prove who you are.",
                 )
             if headers.get("www-authenticate"):
                 add(
                     "authentication_required",
                     20,
-                    "WWW-Authenticate header present",
+                    "The response carries a WWW-Authenticate header.",
                 )
 
         if status == 403:
             add(
                 "forbidden",
                 95,
-                "status 403 Forbidden",
+                "The server understood the request but refuses to share "
+                "this.",
             )
 
         if (
@@ -2102,21 +2236,21 @@ class EndpointAnalyzer:
             add(
                 "authentication_required",
                 85,
-                "redirected to a login/authentication path",
+                "Visitors are redirected to a login or sign-in page.",
             )
 
         if 200 <= status < 300:
             add(
                 "public",
                 80,
-                "2xx response without supplied credentials",
+                "Anyone can read this without logging in.",
             )
 
         if not evidence:
             add(
                 "unknown",
                 1,
-                "no access signal matched",
+                "Nothing in the response says whether login is needed.",
             )
 
         order = (
@@ -2177,20 +2311,20 @@ class EndpointAnalyzer:
             observations.append("X-Content-Type-Options: nosniff")
         elif is_browser_facing:
             issues.append("missing_or_invalid_x_content_type_options")
-            evidence.append("browser-facing response is missing X-Content-Type-Options: nosniff")
+            evidence.append("Browser-facing response is missing X-Content-Type-Options: nosniff")
 
         if is_browser_facing:
             if headers.get("content-security-policy"):
                 observations.append("Content-Security-Policy is present")
             else:
                 issues.append("missing_csp")
-                evidence.append("browser-facing response is missing Content-Security-Policy")
+                evidence.append("Browser-facing response is missing Content-Security-Policy")
 
             if headers.get("x-frame-options"):
                 observations.append("X-Frame-Options is present")
             else:
                 issues.append("missing_x_frame_options")
-                evidence.append("browser-facing response is missing X-Frame-Options")
+                evidence.append("Browser-facing response is missing X-Frame-Options")
 
         if headers.get("cache-control"):
             observations.append(f"Cache-Control: {self._truncate(headers['cache-control'], MAX_HEADER_VALUE)}")
@@ -2210,6 +2344,176 @@ class EndpointAnalyzer:
             "observations": observations,
             "evidence": evidence,
         }
+
+    @staticmethod
+    def _first_write_method(result: dict[str, Any]) -> str | None:
+        """First non-read method the server advertises, for a useful next step."""
+        allowed = (result.get("headers") or {}).get("allow") or ""
+        for raw in str(allowed).split(","):
+            method = raw.strip().upper()
+            if method and method not in ("GET", "HEAD", "OPTIONS"):
+                return method
+        return None
+
+    def _build_verdict(self, result: dict[str, Any]) -> dict[str, str]:
+        """Plain-English verdict: is the site up, and is this an API?
+
+        Built purely from signals already on the result, so it costs no
+        extra requests. `api_behavior` / `access` keep the scored machine
+        labels the dashboard renders; this is the version a person reads.
+        """
+        error = result.get("error")
+        status = result.get("status")
+        behavior = (
+            (result.get("api_behavior") or {}).get("classification")
+            or "uncertain"
+        )
+        access = (
+            (result.get("access") or {}).get("classification")
+            or "unknown"
+        )
+        struct = result.get("response_structure")
+        stype = struct.get("type") if isinstance(struct, dict) else None
+        content_type = result.get("content_type")
+
+        if error:
+            entry = _VERDICT_BY_ERROR.get(error.get("type"))
+            if entry:
+                return _verdict(*entry)
+            return _verdict(
+                "not_checked",
+                "Not checked — the request never completed",
+                error.get("message")
+                or "No response was collected for this address.",
+                "Read the error field for the underlying reason.",
+            )
+
+        if status in (404, 410):
+            return _verdict(
+                "not_found",
+                "Site is up — nothing lives at this address",
+                "The server is reachable but reports that this path does "
+                "not exist.",
+                "Check the spelling, or find the right route in the API docs.",
+            )
+
+        if status is not None and 500 <= status < 600:
+            return _verdict(
+                "server_error",
+                "Site is up but the server failed here",
+                "The server is reachable but broke while handling this "
+                "request.",
+                "Retry later, and report this path to whoever runs the site.",
+            )
+
+        if status == 429:
+            return _verdict(
+                "rate_limited",
+                "Site is up but rate-limiting you",
+                "The server is reachable but is throttling how often you "
+                "may ask.",
+                "Wait before retrying, and send fewer requests per second.",
+            )
+
+        if status in (301, 302, 303, 307, 308):
+            return _verdict(
+                "redirected",
+                "Site is up — this address only redirects",
+                "The server sends visitors somewhere else instead of "
+                "answering here.",
+                "Follow the redirect and analyze the address it lands on.",
+            )
+
+        if stype == "html" or content_type == "text/html":
+            if access == "authentication_required":
+                return _verdict(
+                    "login_page",
+                    "Site is up — this is a login page",
+                    "Visitors are sent to a sign-in page instead of "
+                    "straight to this content.",
+                    "Log in and repeat the request so the real response "
+                    "is visible.",
+                )
+            if access == "forbidden":
+                return _verdict(
+                    "web_page_forbidden",
+                    "Site is up — the page exists but is not public",
+                    "The server returned a normal web page and refused to "
+                    "show it to you.",
+                    "Try again with a session or a token that has access.",
+                )
+            if status is None or 200 <= status < 300:
+                return _verdict(
+                    "web_page",
+                    "Website is up — this is a web page, not an API",
+                    "Anyone visiting this address gets an ordinary HTML "
+                    "page.",
+                    "Nothing to call here; look for a documented or JSON "
+                    "route nearby.",
+                )
+            return _verdict(
+                "web_page_error",
+                "Site is up — but it would not serve this page",
+                "The server returned a normal web page alongside an error "
+                "status.",
+                "Check the status the server returned before trusting "
+                "this path.",
+            )
+
+        if stype == "binary" or content_type in _JS_CSS_TYPES:
+            return _verdict(
+                "static_file",
+                "Site is up — this is a static file, not an API",
+                "The server returned an asset for browsers to download "
+                "rather than data to call.",
+                "Skip this path; look for a route that answers with JSON "
+                "or XML.",
+            )
+
+        next_step = _ACCESS_NEXT_STEP.get(
+            access, _ACCESS_NEXT_STEP["unknown"]
+        )
+        if status == 405:
+            method = self._first_write_method(result)
+            next_step = (
+                "The server turned down a plain read — try sending "
+                f"{method} instead."
+                if method
+                else "The server turned down a plain read — try sending "
+                "POST instead."
+            )
+
+        if behavior == "confirmed":
+            return _verdict(
+                "api",
+                "Yes — this is an API endpoint",
+                "The server answers this path with machine-readable data "
+                "meant for programs.",
+                next_step,
+            )
+        if behavior == "likely":
+            return _verdict(
+                "probably_api",
+                "Probably an API",
+                "The response carries the fingerprints of an API, though "
+                "not a certain one.",
+                next_step,
+            )
+        if behavior == "unlikely":
+            return _verdict(
+                "not_api",
+                "Not an API",
+                "Nothing about this response suggests a machine-facing "
+                "endpoint.",
+                next_step,
+            )
+        return _verdict(
+            "unclear",
+            "Unclear — needs a closer look",
+            "The server answered, but the response does not say whether "
+            "this is an API.",
+            next_step,
+        )
 
     @staticmethod
     def _new_result() -> dict[str, Any]:
@@ -2243,8 +2547,13 @@ class EndpointAnalyzer:
                 "x-content-type-options": None,
                 "x-frame-options": None,
                 "content-security-policy": None,
+                "cache-control": None,
+                "vary": None,
+                "retry-after": None,
+                "server-timing": None,
             },
             "options_probe": None,
+            "verdict": None,
             "api_behavior": {
                 "classification": "uncertain",
                 "evidence": [],
