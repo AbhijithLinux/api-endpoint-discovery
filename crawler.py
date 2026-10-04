@@ -60,8 +60,16 @@ def apply_port(url, port):
     )
 
 
-def fetch_page(url):
-    response = requests.get(url, timeout=5)
+def fetch_page(url, retries=1):
+    """GET one page. Slow targets (VPN boxes, cold containers) often drop
+    the first attempt and answer the second, so one retry on timeout only.
+    Other errors are raised to the caller immediately."""
+    try:
+        response = requests.get(url, timeout=5)
+    except requests.Timeout:
+        if retries <= 0:
+            raise
+        response = requests.get(url, timeout=5)
 
     print("Status:", response.status_code)
 
@@ -147,7 +155,9 @@ def extract_template_literal_urls(html, current_url):
     return list(dict.fromkeys(found))
 
 
-def crawl(start_url, max_pages=50, delay=0.0):
+def crawl(start_url, max_pages=50, delay=0.0, on_page=None, on_error=None):
+    """Crawl same-domain pages. `on_page(record)` fires per fetched page;
+    `on_error({"url", "reason"})` fires per skipped page (404/timeout/…)."""
 
     domain = urlparse(start_url).netloc
 
@@ -216,6 +226,12 @@ def crawl(start_url, max_pages=50, delay=0.0):
             results.append(
                 {"url": canon, "status": status, "content_type": content_type}
             )
+            if on_page is not None:
+                try:
+                    on_page({"url": canon, "status": status,
+                             "content_type": content_type})
+                except Exception:
+                    pass
 
             links = extract_links(html, canon)
 
@@ -256,12 +272,24 @@ def crawl(start_url, max_pages=50, delay=0.0):
 
             if e.response is not None and e.response.status_code == 404:
                 print(f"Skipping 404: {url}")
+                reason = "404 not found"
             else:
                 print("HTTP Error:", e)
+                reason = f"HTTP error: {e}"
+            if on_error is not None:
+                try:
+                    on_error({"url": url, "reason": reason})
+                except Exception:
+                    pass
 
         except requests.RequestException as e:
 
             print("Error:", e)
+            if on_error is not None:
+                try:
+                    on_error({"url": url, "reason": f"{type(e).__name__}: {e}"})
+                except Exception:
+                    pass
 
         finally:
             last_request_end = time.monotonic()
@@ -273,9 +301,13 @@ def crawl(start_url, max_pages=50, delay=0.0):
     for hit in template_hits:
         if hit not in existing:
             existing.add(hit)
-            results.append(
-                {"url": hit, "status": 200, "content_type": "text/html"}
-            )
+            rec = {"url": hit, "status": 200, "content_type": "text/html"}
+            results.append(rec)
+            if on_page is not None:
+                try:
+                    on_page(rec)
+                except Exception:
+                    pass
 
     return results
 
