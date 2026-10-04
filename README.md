@@ -22,13 +22,19 @@ No heavy frameworks. No magic. Just `requests` + `BeautifulSoup` + clean heurist
 # 1. Set up (once)
 python3 -m venv venv
 source venv/bin/activate          # Windows: .\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements.txt   # includes flask, gunicorn, pyyaml, fpdf2
 
-# 2. Run the full pipeline (terminal 2)
+# 2a. Full pipeline via CLI
 python crawler.py http://<TARGET-ADDRESS>/ --analyze
+
+# 2b. Or via the live dashboard (recommended)
+python app.py                     # open http://127.0.0.1:5000
+# Windows: prefer the project venv — bare `python app.py` under system
+# Python 500s on ?format=pdf when fpdf2 lives only in the venv:
+.\venv\Scripts\python.exe app.py
 ```
 
-Example: pages crawled → API candidates → a JSON report with classifications like `confirmed`, `likely`, `public`. Counts depend on the target.
+Example: pages crawled → API candidates → verdicts like `confirmed`, `likely`, `public`. Counts depend on the target.
 
 ---
 
@@ -67,7 +73,7 @@ python crawler.py http://localhost:3000/ --analyze -o results.json
 | `-o FILE` | Write the report to `FILE` instead of stdout |
 | `--max-pages N` | Stop crawling after `N` pages (default: 50) |
 | `--delay SECONDS` | Wait N seconds between requests to avoid bombarding the site (default: 0) |
-| `--wordlist FILE` | Extra wordlist file (one path per line, `#` comments ignored); e.g. `--wordlist common_wordlist.txt`. Wordlist probing is opt-in only — no built-in default. |
+| `--wordlist FILE` | Extra wordlist file of any size (one path per line, `#` comments ignored); e.g. `--wordlist common_wordlist.txt`. Wordlist probing is opt-in only — no built-in default. |
 | `--enum-ids N` | Fuzz query params: enumerate numeric values `1..N`, boundary/type probes (`0`, `-1`, `99999`, `abc`), probe common params on bare API endpoints. `0` disables (default: `0`). |
 | `-p PORT`, `--port PORT` | Force port on target URL (e.g. `-p 8080`); overrides any port already in the URL. Useful for bare IP/host targets. |
 | `-v` | Show each wordlist path as it is checked |
@@ -102,8 +108,9 @@ Each endpoint gets one safe GET (sensitive query values are blanked before sendi
 
 - **Basics** — `method`, `status`, `status_category`, `content_type`, `response_time_ms`, `response_size`, `final_url` + `redirect_chain`, selected headers (incl. `x-content-type-options`, `x-frame-options` observations)
 - **Shape** — `parameters` (query + numeric/UUID path IDs), `response_structure` (inferred JSON keys/nested/item types; XML/SOAP element tree with RSS/Atom feed and SOAP-fault flags; `html` / `text` / `binary` / `empty` / `unknown`)
-- **Verdict** — `api_behavior`: `confirmed` ✅ / `likely` / `uncertain` / `unlikely`, each with human-readable evidence
+- **Verdict** — `api_behavior`: `confirmed` ✅ / `likely` / `uncertain` / `unlikely`, each with human-readable evidence, plus a plain-English `verdict` (`api`, `probably_api`, `web_page`, …) with a summary and suggested next step
 - **Exposure** — `access`: `public` 🌐 / `authentication_required` / `forbidden` / `unknown`
+- **Security posture** — missing-header issues (`missing_hsts`, `missing_csp`, CORS signals…), `sensitive_findings` (leaked secrets/tokens in responses)
 - **Honesty** — `warnings` and per-endpoint `error` objects; one bad URL never kills the batch
 - **OPTIONS probe** — on a 405 GET, one lightweight `OPTIONS` request follows (no redirects/body) to capture `Allow` methods for the verdict; recorded as `options_probe: {status, error}`. Disable with `EndpointAnalyzer(options_probe=False)`.
 
@@ -127,10 +134,12 @@ python endpoint_analysis.py discovery.json analysis.json
 ## 🕷️ Crawler notes
 
 - Follows `<a href>` links only (same-domain, breadth-first). Doc-looking pages (`swagger`, `graphql`, `webhook`, …) are queued first, docs-first.
+- Slow targets get **one automatic retry on timeout** (VPN boxes and cold containers often drop the first attempt and answer the second). Other errors fail fast.
 - Template-literal URLs (e.g. `` `/api/products/${id}/price` `` in inline scripts) are extracted, `${...}` is normalized to `1`, and appended as records so discovery flags them — they don't count against `--max-pages` and are never re-crawled for links.
 - HTTP redirects are canonicalized: the **final** URL is recorded, so links that bounce to `/` don't create duplicate homepage entries. 404s are skipped; other HTTP/network errors are logged, never fatal.
 - Fragment-only links (`page.html#menu` vs `page.html#`) are normalized (`#` stripped) before queuing/visiting, so anchors never create duplicate pages or extra requests.
 - `-p/--port` forces the port on the target (bare IP/host friendly, IPv6-aware, overrides any port in the URL). `--delay` throttles between requests.
+- Library hooks for live UIs: `crawl(..., on_page=cb, on_error=cb)` streams each fetched page and each skip (`{url, reason}`) as it happens. Both are optional and backward compatible.
 
 ## 🖥️ Dashboard
 
@@ -139,13 +148,31 @@ python app.py                                       # http://127.0.0.1:5000
 # Production: Procfile runs gunicorn app:app --threads 8
 ```
 
-Real-time SSE scan: sites-crawled + endpoints-found scroll boxes, click an endpoint to expand its analysis (status, content-type, evidence, parameters, full JSON). Dark/light toggle. Note: the dashboard runs `crawl(max_pages=50)` → discover → analyze with defaults — no `--wordlist` / `--enum-ids` passthrough (use the CLI for those).
+Real-time SSE scan with per-scan numbering (`scan #1, #2, …` addressable as `/api/result/2`):
+
+- **Scan options card** — Max pages (1–500, your input, no hardcoding), Enum IDs (`--enum-ids` passthrough, 0 = off).
+- **Wordlist card** — paste paths, upload any `.txt` file of **any size** (path brute-forcing is uncapped — no truncation; note the separate fuzz caps below), Clear button, optional bundled `common_wordlist.txt`. Live "Probed N paths → M live" summary after discovery.
+- **Parameter fuzzing card** (opt-in) — param name + numeric range (From/To shown only in range mode) or word list (up to 50 words kept exactly, spacing included; at most 100 variants total — these caps stay because variants multiply per endpoint). Variants stream in tagged `param-fuzz` and are analyzed like everything else.
+- **Sites crawled / Endpoints found** — scrollable tables with live progress bar and phase narration (`Crawling…`, `Analyzing endpoint i/N…`); unreachable pages surface as a counter instead of vanishing silently. Re-scanning can never show the previous scan's rows (per-scan stream isolation + generation guards).
+- **Endpoints table** — URL (clickable hyperlink), Source, Result badge with plain-language hover meanings, Status column; per-category counts, category dropdown filter, click-to-expand inline analysis with verdict, evidence, security posture, sensitive findings, OPTIONS data, parameters, full JSON, and a **Copy analysis** button. Dark/light toggle with persisted theme; link colors readable in both.
+- **Reports** — Download button with **JSON / YAML / PDF** picker. The PDF carries the findings table (URL, status, content-type, behavior, access, source, verdict), verdict/source breakdowns, request counts, wall-clock duration, and per-endpoint details (evidence, shape, params, security issues, sensitive findings, methods, auth, warnings, errors, redirects).
+- **Storage hygiene** — reports expire after 30 minutes (background sweeper purges them; stale links return `410 Gone`). `POST /api/scan` answers with `expires_in_seconds` so clients know the TTL up front.
+
+### 🔌 Dashboard API
+
+| Method & path | What it does |
+|---|---|
+| `POST /api/scan` | Start a scan (`url`, `max_pages`, `enum_ids`, `extra_paths`, `use_default_wordlist`, `fuzz`). Returns `{scan_id, scan_no, expires_in_seconds}` — scans are addressable by id *or* sequential number |
+| `GET /api/stream/<id-or-no>` | Server-Sent Events: live pages, candidates, results, phase/progress, wordlist summary, `done` |
+| `GET /api/result/<id-or-no>` | Full scan JSON (status, target, pages, candidates, results) |
+| `GET /api/report/<id-or-no>?format=json\|yaml\|pdf` | Download the report as a file (`scan-<host>-<id>.json/.yaml/.pdf`) |
 
 ---
 
 ## 🚧 Known limitations
 
 - The crawler follows `<a href>` links only — JS-rendered SPAs yield few pages (discovery's same-origin script scan compensates).
+- Status-code probing trusts the server: catch-all hosts that return `200` for every path (SPA shells) produce false-positive candidates — analysis still classifies them `unlikely`, but they cost requests. No soft-404 shell filtering in this tree.
 - Analysis is GET-first with one conditional `OPTIONS` probe on 405 — POST/PUT/DELETE endpoints are otherwise judged by their GET behavior.
 - Template-literal extraction covers inline scripts only; external `<script src>` bundles aren't scanned for backtick URLs (discovery's `javascript` source still regexes them for quoted API strings, same-origin only).
 
