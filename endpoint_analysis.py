@@ -245,6 +245,7 @@ class EndpointAnalyzer:
         redact_sensitive: bool = False,
         send_sensitive_params: bool = False,
         options_probe: bool = True,
+        always_probe: bool = False,
         allowed_hosts: list[str] | tuple[str, ...] | set[str] | None = None,
         allowed_redirect_hosts: list[str] | tuple[str, ...] | set[str] | None = None,
         inspect_sensitive_response_data: bool = True,
@@ -285,6 +286,7 @@ class EndpointAnalyzer:
         self.redact_sensitive = bool(redact_sensitive)
         self.send_sensitive_params = bool(send_sensitive_params)
         self.options_probe = bool(options_probe)
+        self.always_probe = bool(always_probe)
         self.allowed_hosts = self._normalize_host_set(allowed_hosts)
         self.allowed_redirect_hosts = self._normalize_host_set(allowed_redirect_hosts)
         self.inspect_sensitive_response_data = bool(inspect_sensitive_response_data)
@@ -747,7 +749,7 @@ class EndpointAnalyzer:
         result: dict[str, Any],
         initial_url: str,
     ) -> dict[str, Any] | None:
-        """Manual-redirect GET loop with optional OPTIONS fallback on 405."""
+        """Manual-redirect GET loop with an optional OPTIONS probe."""
         current_url = initial_url
         chain: list[str] = [initial_url]
         redirect_host = self._redirect_host(initial_url)
@@ -924,7 +926,16 @@ class EndpointAnalyzer:
                             "redirect without Location"
                         )
 
-                    if status == 405 and self.options_probe:
+                    # 405 keeps its probe (that is where Allow is most
+                    # informative). always_probe adds one on successful
+                    # reads only — scoping it to 2xx avoids doubling the
+                    # request count against every 404/429/5xx the crawler
+                    # turns up, and stops piling onto a server that is
+                    # already rate-limiting us.
+                    if self.options_probe and (
+                        status == 405
+                        or (self.always_probe and 200 <= status < 300)
+                    ):
                         try:
                             response.close()
                         except Exception:
@@ -954,7 +965,7 @@ class EndpointAnalyzer:
         url: str,
         result: dict[str, Any],
     ) -> dict[str, Any]:
-        """Perform a lightweight OPTIONS probe after a 405 GET response."""
+        """Perform a lightweight OPTIONS probe after a GET response."""
         try:
             self._throttle()
             logger.debug(
@@ -2026,12 +2037,17 @@ class EndpointAnalyzer:
         ) or ""
 
         if opt_status in (200, 204) and (opt_allow or opt_acam):
-            add(
-                "likely",
-                85,
-                "The server turned down a plain read but listed the "
-                "methods it does accept.",
-            )
+            # Only weight this as API evidence when the read was
+            # actually refused. After a plain 200 an `Allow: GET,
+            # HEAD` header adds nothing the 200 didn't already say.
+            # The write-method bonus below still applies either way.
+            if status == 405:
+                add(
+                    "likely",
+                    85,
+                    "The server turned down a plain read but "
+                    "listed the methods it does accept.",
+                )
 
             methods: set[str] = set()
             for value in (
