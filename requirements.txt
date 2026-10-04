@@ -5,6 +5,8 @@ idna==3.20
 requests==2.34.2
 flask>=3.0
 gunicorn>=21.0
+pyyaml>=6.0
+fpdf2>=2.8
 soupsieve==2.9.2
 typing_extensions==4.16.0
 urllib3==2.8.0
